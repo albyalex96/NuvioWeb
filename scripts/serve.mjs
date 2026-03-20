@@ -224,7 +224,31 @@ async function handleProxy(request, response, requestUrl) {
     });
 
     const upstreamContentType = upstreamResponse.headers.get("content-type") || "";
+    const contentType = upstreamResponse.headers.get("content-type") || "";
+const isBase64Video = contentType.includes("text/plain") 
+  || contentType.includes("application/octet-stream")
+  || contentType === "";
 
+if (isBase64Video) {
+  const text = await upstreamResponse.text();
+  const trimmed = text.trim();
+  
+  // Controlla se è Base64 valido e inizia con la firma MP4 (AAAAI = 0x00000020 in base64)
+  const looksLikeBase64 = /^[A-Za-z0-9+/]+=*$/.test(trimmed.substring(0, 100));
+  
+  if (looksLikeBase64) {
+    const buffer = Buffer.from(trimmed, "base64");
+    response.writeHead(200, {
+      ...CORS_HEADERS,
+      "Content-Type": "video/mp4",
+      "Content-Length": String(buffer.byteLength),
+      "Cache-Control": "no-store",
+      "Accept-Ranges": "bytes",
+    });
+    response.end(buffer);
+    return;
+  }
+}
     // Costruisce gli header della risposta verso il client
     const responseHeaders = {
       ...CORS_HEADERS,
