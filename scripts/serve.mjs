@@ -94,8 +94,8 @@ function isM3u8Response(contentType, targetUrl) {
  * Costruisce l'URL del proxy locale per una risorsa esterna.
  * Es: http://localhost:4173/proxy?url=https%3A%2F%2F...
  */
-function buildProxyUrl(absoluteTargetUrl, baseServerUrl) {
-  return `${baseServerUrl}/proxy?url=${encodeURIComponent(absoluteTargetUrl)}`;
+function buildProxyUrl(absoluteTargetUrl) {
+  return `/proxy?url=${encodeURIComponent(absoluteTargetUrl)}`;
 }
 
 /**
@@ -118,7 +118,7 @@ function resolveSegmentUrl(relative, manifestBaseUrl) {
  *  - #EXT-X-MEDIA URI="..."       (audio/subtitle alternate tracks)
  *  - playlist varianti (master m3u8 con righe URL di sotto-playlist)
  */
-function rewriteM3u8(content, originalUrl, baseServerUrl) {
+function rewriteM3u8(content, originalUrl) {
   // Base URL = tutto tranne il filename finale del manifest
   const manifestBaseUrl = originalUrl.substring(0, originalUrl.lastIndexOf("/") + 1);
 
@@ -134,7 +134,7 @@ function rewriteM3u8(content, originalUrl, baseServerUrl) {
     if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
       return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
         const absolute = resolveSegmentUrl(uri, manifestBaseUrl);
-        return `URI="${buildProxyUrl(absolute, baseServerUrl)}"`;
+        return `URI="${buildProxyUrl(absolute)}"`;
       });
     }
 
@@ -143,7 +143,7 @@ function rewriteM3u8(content, originalUrl, baseServerUrl) {
 
     // Riga dati: può essere un URL assoluto o relativo (segmento o sotto-playlist)
     const absolute = resolveSegmentUrl(trimmed, manifestBaseUrl);
-    return buildProxyUrl(absolute, baseServerUrl);
+    return buildProxyUrl(absolute);
   });
 
   return rewritten.join("\n");
@@ -158,7 +158,7 @@ function rewriteM3u8(content, originalUrl, baseServerUrl) {
  *  - HEAD requests
  *  - Redirect automatici (follow)
  */
-async function handleProxy(request, response, requestUrl, baseServerUrl) {
+async function handleProxy(request, response, requestUrl) {
   const targetParam = requestUrl.searchParams.get("url");
 
   if (!targetParam) {
@@ -247,7 +247,7 @@ async function handleProxy(request, response, requestUrl, baseServerUrl) {
     // ── Manifest m3u8: riscrittura URL e risposta testuale ──
     if (isM3u8Response(upstreamContentType, targetUrl)) {
       const manifestText = await upstreamResponse.text();
-      const rewritten = rewriteM3u8(manifestText, targetUrl.href, baseServerUrl);
+      const rewritten = rewriteM3u8(manifestText, targetUrl.href);
       const rewrittenBuffer = Buffer.from(rewritten, "utf-8");
 
       responseHeaders["Content-Type"]   = "application/vnd.apple.mpegurl; charset=utf-8";
