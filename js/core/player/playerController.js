@@ -49,6 +49,27 @@ export const PlayerController = {
   webosUnsupportedAudioCodecs: new Set(["dts", "truehd"]),
   viewportSyncHandler: null,
 
+  getProxyUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return raw;
+
+  let parsed;
+  try {
+    parsed = new URL(raw, window.location.href);
+  } catch (_) {
+    return raw; // URL malformato: lascia passare
+  }
+
+  // Già un URL locale/relativo → non serve proxy
+  if (parsed.origin === window.location.origin) return raw;
+
+  // Protocolli non-http (blob:, data:, ecc.) → non proxabili
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return raw;
+
+  // Costruisce l'URL proxy puntando al server locale
+  return `${window.location.origin}/proxy?url=${encodeURIComponent(parsed.href)}`;
+},
+
   isExpectedPlayInterruption(error) {
     const message = String(error?.message || "").toLowerCase();
     const name = String(error?.name || "").toLowerCase();
@@ -1323,7 +1344,7 @@ export const PlayerController = {
 
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
       try {
-        hls.loadSource(url);
+        hls.loadSource(this.getProxyUrl(url));
       } catch (error) {
         console.warn("HLS source attach failed", error);
         this.lastPlaybackErrorCode = 4;
@@ -1378,7 +1399,7 @@ export const PlayerController = {
           stableBufferTime: isWebOs ? 8 : 12
         }
       });
-      player.initialize(this.video, url, true);
+      player.initialize(this.video, this.getProxyUrl(url), true);
       const dashEvents = dashJsEngine.getEvents();
       const emitTracksChanged = () => {
         this.emitVideoEvent("dashtrackschanged", { playbackEngine: "dash.js" });
@@ -1892,6 +1913,7 @@ export const PlayerController = {
     this.playRequestToken = playToken;
 
     const sourceType = String(mediaSourceType || this.guessMediaMimeType(url) || "").trim() || null;
+    const proxiedUrl = this.canUseAvPlay() ? url : this.getProxyUrl(url);
     const preferredEngine = forceEngine || this.choosePlaybackEngine(url, sourceType);
     this.rememberPlaybackEngineAttempt(this.currentPlaybackUrl, preferredEngine, {
       reset: !forceEngine
@@ -1913,7 +1935,7 @@ export const PlayerController = {
     if (preferredEngine === this.getPlatformAvplayEngineName()) {
       const avplayStarted = this.playWithAvPlay(url);
       if (!avplayStarted) {
-        this.applyNativeSource(url, sourceType || null, nativeFallbackEngine);
+        this.applyNativeSource(proxiedUrl, sourceType || null, nativeFallbackEngine);
         this.attemptVideoPlay({
           warningLabel: "Playback start rejected",
           playToken,
@@ -1933,7 +1955,7 @@ export const PlayerController = {
     } else if (preferredEngine === "hls.js") {
       const hlsStarted = this.playWithHlsJs(url, requestHeaders);
       if (!hlsStarted) {
-        this.applyNativeSource(url, sourceType || "application/vnd.apple.mpegurl", "native-hls");
+        this.applyNativeSource(proxiedUrl, sourceType || "application/vnd.apple.mpegurl", "native-hls");
         this.attemptVideoPlay({
           warningLabel: "Playback start rejected",
           playToken,
@@ -1943,7 +1965,7 @@ export const PlayerController = {
     } else if (preferredEngine === "dash.js") {
       const dashStarted = this.playWithDashJs(url);
       if (!dashStarted) {
-        this.applyNativeSource(url, sourceType || "application/dash+xml", "native-dash");
+        this.applyNativeSource(proxiedUrl, sourceType || "application/dash+xml", "native-dash");
       }
       this.attemptVideoPlay({
         warningLabel: "DASH playback start rejected",
@@ -1951,7 +1973,7 @@ export const PlayerController = {
         beforePlay: dashStarted ? null : () => this.waitForNativeMediaId()
       });
     } else if (preferredEngine === "native-hls") {
-      this.applyNativeSource(url, sourceType || "application/vnd.apple.mpegurl", "native-hls");
+      this.applyNativeSource(proxiedUrl, sourceType || "application/vnd.apple.mpegurl", "native-hls");
       this.attemptVideoPlay({
         warningLabel: "Native HLS playback start rejected",
         playToken,
@@ -1968,7 +1990,7 @@ export const PlayerController = {
         }
       });
     } else if (preferredEngine === "native-dash") {
-      this.applyNativeSource(url, sourceType || "application/dash+xml", "native-dash");
+      this.applyNativeSource(proxiedUrl, sourceType || "application/dash+xml", "native-dash");
       this.attemptVideoPlay({
         warningLabel: "Native DASH playback start rejected",
         playToken,
@@ -1985,7 +2007,7 @@ export const PlayerController = {
         }
       });
     } else {
-      this.applyNativeSource(url, sourceType || null, "native-file");
+      this.applyNativeSource(proxiedUrl, sourceType || null, "native-file");
       this.attemptVideoPlay({
         warningLabel: "Playback start rejected",
         playToken,
