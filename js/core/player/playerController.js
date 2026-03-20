@@ -57,17 +57,21 @@ export const PlayerController = {
   try {
     parsed = new URL(raw, window.location.href);
   } catch (_) {
-    return raw; // URL malformato: lascia passare
+    return raw;
   }
 
-  // Già un URL locale/relativo → non serve proxy
   if (parsed.origin === window.location.origin) return raw;
-
-  // Protocolli non-http (blob:, data:, ecc.) → non proxabili
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return raw;
 
-  // Costruisce l'URL proxy puntando al server locale
-  return `${window.location.origin}/proxy?url=${encodeURIComponent(parsed.href)}`;
+  // Forza https se la pagina è raggiunta in https,
+  // altrimenti usa il protocollo reale della pagina.
+  // Questo copre il caso HuggingFace dove window.location.origin
+  // può restituire http:// anche se il sito è esposto in https.
+  const pageProtocol = window.location.protocol; // "http:" o "https:"
+  const safeProtocol = pageProtocol === "https:" ? "https:" : "http:";
+  const proxyBase = `${safeProtocol}//${window.location.host}`;
+
+  return `${proxyBase}/proxy?url=${encodeURIComponent(parsed.href)}`;
 },
 
   isExpectedPlayInterruption(error) {
