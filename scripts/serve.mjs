@@ -187,7 +187,15 @@ async function handleProxy(request, response, requestUrl) {
   ]);
 
   // Costruisce gli header da inviare all'upstream
-  const upstreamHeaders = {};
+  const upstreamHeaders = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": targetUrl.origin + "/",
+  "Origin": targetUrl.origin,
+  "Accept": "*/*",
+  };
+  if (request.headers["range"]) {
+  upstreamHeaders["Range"] = request.headers["range"];
+  }
   for (const [key, value] of Object.entries(request.headers)) {
     if (!SKIP_UPSTREAM_HEADERS.has(key.toLowerCase())) {
       upstreamHeaders[key] = value;
