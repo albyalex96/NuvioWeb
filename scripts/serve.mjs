@@ -319,7 +319,7 @@ const server = http.createServer(async (request, response) => {
     if (requestUrl.pathname === "/proxy") {
       // Costruisce il base URL del server (es: http://localhost:4173)
       // usato per riscrivere gli URL nel manifest m3u8
-      const serverBase = `http://${request.headers.host || `localhost:${port}`}`;
+      const serverBase = `https://${request.headers.host || `localhost:${port}`}`;
       await handleProxy(request, response, requestUrl, serverBase);
       return;
     }
