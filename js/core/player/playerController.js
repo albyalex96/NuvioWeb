@@ -68,8 +68,7 @@ export const PlayerController = {
   // Questo copre il caso HuggingFace dove window.location.origin
   // può restituire http:// anche se il sito è esposto in https.
   const pageProtocol = window.location.protocol; // "http:" o "https:"
-  const safeProtocol = pageProtocol === "https:" ? "https:" : "https:";
-  const proxyBase = `${safeProtocol}//${window.location.host}`;
+  const proxyBase = window.location.origin.replace(/^http:\/\//, "https://");
 
   return `${proxyBase}/proxy?url=${encodeURIComponent(parsed.href)}`;
 },
