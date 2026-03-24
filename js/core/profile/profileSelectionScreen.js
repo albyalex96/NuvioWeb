@@ -4,9 +4,63 @@ import { ProfileSyncService } from "../../core/profile/profileSyncService.js";
 import { StartupSyncService } from "../../core/profile/startupSyncService.js";
 import { ScreenUtils } from "../../ui/navigation/screen.js";
 import { AvatarRepository } from "../../data/remote/supabase/avatarRepository.js";
+import { Platform } from "../../platform/index.js";
 
 const PINNED_AVATAR_CATEGORIES = ["anime", "animation", "tv", "movie", "gaming"];
-const DEFAULT_PROFILE_COLOR = "#1E88E5";
+const DEFAULT_PROFILE_COLOR = "#f5f5f5";
+const PROFILE_HOLD_DELAY_MS = 650;
+const PROFILE_PIN_LENGTH = 4;
+const PROFILE_PIN_OPEN_MS = 320;
+const PROFILE_PIN_CLOSE_MS = 240;
+const PROFILE_PIN_TEXT = {
+  set: "Set PIN",
+  change: "Change PIN",
+  remove: "Remove PIN",
+  headingSet: (name) => `Create a 4-digit PIN for ${name}.`,
+  headingUnlock: (name) => `Enter your PIN to access ${name}.`,
+  headingConfirm: "Confirm your new PIN.",
+  headingVerifyChange: (name) => `Enter current PIN to change PIN for ${name}.`,
+  headingVerifyRemove: (name) => `Enter current PIN to remove lock for ${name}.`,
+  supportSet: "This PIN will be required before opening this profile.",
+  supportUnlock: "Use your remote or keyboard to enter 4 digits.",
+  supportConfirm: "Re-enter the same 4 digits to finish setup.",
+  supportVerifyChange: "Enter the current 4-digit PIN before setting a new one.",
+  supportVerifyRemove: "Enter the current 4-digit PIN to remove this lock.",
+  mismatch: "PINs did not match. Enter a new PIN again.",
+  forgot: "Forgot PIN? Reset it from your Nuvio account on nuvio website.",
+  back: "Press back to cancel",
+  verifying: "Verifying…",
+  saving: "Saving…",
+  saved: (name) => `PIN saved for ${name}.`,
+  removed: (name) => `PIN lock removed for ${name}.`,
+  saveFailed: "Could not save PIN. Try again.",
+  verifyFailed: "Could not verify PIN. Try again.",
+  invalidPin: "Invalid PIN. Try again.",
+  incorrectCurrent: "Current PIN is incorrect.",
+  lockedRetry: (seconds) => `Profile is locked. Try again in ${seconds}s.`
+};
+
+function keyEventToDigit(event) {
+  const key = String(event?.key || "");
+  if (/^\d$/.test(key)) {
+    return key;
+  }
+  const code = Number(event?.keyCode || event?.which || 0);
+  if (code >= 48 && code <= 57) {
+    return String(code - 48);
+  }
+  if (code >= 96 && code <= 105) {
+    return String(code - 96);
+  }
+  return null;
+}
+
+function getDefaultProfileColor() {
+  const value = globalThis?.document
+    ? getComputedStyle(document.documentElement).getPropertyValue("--secondary-color").trim()
+    : "";
+  return value || DEFAULT_PROFILE_COLOR;
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -95,6 +149,49 @@ function isTextInput(node) {
   return tagName === "input" || tagName === "textarea";
 }
 
+function getNodeHorizontalCenter(node) {
+  const rect = node?.getBoundingClientRect?.();
+  if (!rect) {
+    return 0;
+  }
+  return rect.left + (rect.width / 2);
+}
+
+function findNearestByHorizontalCenter(referenceNode, candidates) {
+  const nodes = (Array.isArray(candidates) ? candidates : []).filter(Boolean);
+  if (!referenceNode || !nodes.length) {
+    return null;
+  }
+  const referenceCenter = getNodeHorizontalCenter(referenceNode);
+  return nodes
+    .map((node) => ({
+      node,
+      distance: Math.abs(getNodeHorizontalCenter(node) - referenceCenter)
+    }))
+    .sort((left, right) => left.distance - right.distance)[0]?.node || null;
+}
+
+function buildVisualRows(nodes, tolerance = 18) {
+  const rows = [];
+  (Array.isArray(nodes) ? nodes : []).filter(Boolean).forEach((node) => {
+    const rect = node.getBoundingClientRect();
+    const existingRow = rows.find((entry) => Math.abs(entry.top - rect.top) <= tolerance);
+    if (existingRow) {
+      existingRow.nodes.push(node);
+      return;
+    }
+    rows.push({
+      top: rect.top,
+      nodes: [node]
+    });
+  });
+  rows.sort((left, right) => left.top - right.top);
+  rows.forEach((row) => {
+    row.nodes.sort((left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left);
+  });
+  return rows;
+}
+
 export const ProfileSelectionScreen = {
 
   async mount(params = {}) {
@@ -115,12 +212,28 @@ export const ProfileSelectionScreen = {
     this.optionsProfileId = null;
     this.deleteProfileId = null;
     this.editorState = null;
+    this.pinOverlayState = null;
+    this.pinOverlayRenderState = null;
+    this.pinOverlayPhase = "closed";
+    this.pinOverlayError = "";
+    this.pinActionMessage = "";
+    this.pinEntryStage = "create";
+    this.pinValue = "";
+    this.pinDraftValue = "";
+    this.profilePinEnabled = {};
+    this.isPinOperationInProgress = false;
+    this.pinActionMessageTimer = null;
+    this.pinTransitionTimer = null;
+    this.pinTransitionCallback = null;
+    this.suppressedFocusClick = null;
     this.avatarCatalog = [];
+    this.lastKeyboardActivation = null;
 
     await ProfileSyncService.pull();
     this.profiles = await ProfileManager.getProfiles();
+    await this.refreshProfilePinStates();
     this.lastProfileFocusKey = `profile:${this.activeProfileId || "1"}`;
-    if (!this.isManagementMode && this.profiles.length === 1) {
+    if (!this.isManagementMode && this.profiles.length === 1 && !this.isProfilePinEnabled(this.profiles[0]?.id)) {
       await this.activateProfile(this.profiles[0].id);
       return;
     }
@@ -148,6 +261,15 @@ export const ProfileSelectionScreen = {
 
   getVisibleProfiles() {
     return Array.isArray(this.profiles) ? this.profiles : [];
+  },
+
+  async refreshProfilePinStates() {
+    this.profilePinEnabled = await ProfileSyncService.pullProfileLockStates();
+  },
+
+  isProfilePinEnabled(profileId) {
+    const normalizedId = String(profileId || "");
+    return Boolean(this.profilePinEnabled?.[normalizedId] || this.profilePinEnabled?.[Number(normalizedId)]);
   },
 
   getAvatarImageUrl(avatarId) {
@@ -182,27 +304,40 @@ export const ProfileSelectionScreen = {
     const hint = this.isManagementMode
       ? "Select a profile to manage"
       : "Hold to manage profile";
+    const renderedPinState = this.getRenderedPinOverlayState();
+    const isPinActive = Boolean(renderedPinState);
+    const pinScreenPhaseClass = isPinActive ? ` is-pin-${escapeHtml(this.pinOverlayPhase || "open")}` : "";
 
     this.container.innerHTML = `
-      <div class="profile-screen">
-        <img src="assets/brand/app_logo_wordmark.png" class="profile-logo" alt="Nuvio"/>
+      <div class="profile-screen${pinScreenPhaseClass}">
+        <div class="profile-main-layer"${isPinActive ? ' aria-hidden="true"' : ""}>
+          <img src="assets/brand/app_logo_wordmark.png" class="profile-logo" alt="Nuvio"/>
 
-        <h1 class="profile-title">${escapeHtml(title)}</h1>
-        <p class="profile-subtitle">${escapeHtml(subtitle)}</p>
+          <h1 class="profile-title">${escapeHtml(title)}</h1>
+          <p class="profile-subtitle">${escapeHtml(subtitle)}</p>
 
-        <div class="profile-grid" id="profileGrid">
-          ${this.getVisibleProfiles().map((profile) => this.renderProfileCard(profile)).join("")}
-          ${canAddProfile ? this.renderAddProfileCard() : ""}
+          <div class="profile-grid" id="profileGrid">
+            ${this.getVisibleProfiles().map((profile) => this.renderProfileCard(profile)).join("")}
+            ${canAddProfile ? this.renderAddProfileCard() : ""}
+          </div>
+
+          <p class="profile-hint">${escapeHtml(hint)}</p>
         </div>
-
-        <p class="profile-hint">${escapeHtml(hint)}</p>
+        ${this.renderPinOverlay()}
       </div>
       ${this.renderEditorOverlay()}
       ${this.renderOptionsDialog()}
       ${this.renderDeleteDialog()}
+      ${this.renderPinActionToast()}
     `;
 
     this.bindEvents();
+    if (renderedPinState) {
+      const pinProfile = this.getPinOverlayProfile();
+      if (pinProfile?.avatarColorHex) {
+        this.updateBackground(pinProfile.avatarColorHex);
+      }
+    }
     this.restoreFocus();
   },
 
@@ -214,7 +349,7 @@ export const ProfileSelectionScreen = {
            data-focus-key="profile:${escapeHtml(profile.id)}"
            tabindex="0">
         <div class="profile-avatar-ring">
-          <div class="profile-avatar" style="background:${escapeHtml(profile.avatarColorHex || DEFAULT_PROFILE_COLOR)}">
+          <div class="profile-avatar" style="background:${escapeHtml(profile.avatarColorHex || getDefaultProfileColor())}">
             ${avatarUrl
               ? `<img class="profile-avatar-image" src="${escapeHtml(avatarUrl)}" alt="${escapeHtml(profile.name)}"/>`
               : escapeHtml(getProfileInitial(profile.name))}
@@ -280,7 +415,7 @@ export const ProfileSelectionScreen = {
 
           <div class="profile-editor-body">
             <div class="profile-editor-preview">
-              <div class="profile-editor-preview-avatar" style="background:${escapeHtml(this.editorState.selectedColorHex || DEFAULT_PROFILE_COLOR)}">
+              <div class="profile-editor-preview-avatar" style="background:${escapeHtml(this.editorState.selectedColorHex || getDefaultProfileColor())}">
                 ${previewAvatarUrl
                   ? `<img class="profile-editor-preview-image" src="${escapeHtml(previewAvatarUrl)}" alt="${escapeHtml(previewName)}"/>`
                   : escapeHtml(getProfileInitial(previewName))}
@@ -361,6 +496,7 @@ export const ProfileSelectionScreen = {
     if (!profile) {
       return "";
     }
+    const pinEnabled = this.isProfilePinEnabled(profile.id);
 
     return `
       <div class="profile-dialog-backdrop" data-action="dismiss-options-dialog">
@@ -375,6 +511,24 @@ export const ProfileSelectionScreen = {
                     tabindex="0">
               Edit
             </button>
+            <button class="profile-dialog-button profile-focusable focusable"
+                    type="button"
+                    data-action="open-profile-pin"
+                    data-profile-id="${escapeHtml(profile.id)}"
+                    data-focus-key="options:pin"
+                    tabindex="0">
+              ${pinEnabled ? PROFILE_PIN_TEXT.change : PROFILE_PIN_TEXT.set}
+            </button>
+            ${pinEnabled ? `
+              <button class="profile-dialog-button profile-focusable focusable"
+                      type="button"
+                      data-action="remove-profile-pin"
+                      data-profile-id="${escapeHtml(profile.id)}"
+                      data-focus-key="options:remove-pin"
+                      tabindex="0">
+                ${PROFILE_PIN_TEXT.remove}
+              </button>
+            ` : ""}
             ${profile.isPrimary ? "" : `
               <button class="profile-dialog-button profile-dialog-button-danger profile-focusable focusable"
                       type="button"
@@ -387,6 +541,93 @@ export const ProfileSelectionScreen = {
             `}
           </div>
         </div>
+      </div>
+    `;
+  },
+
+  getPinOverlayProfile() {
+    const profileId = this.pinOverlayState?.profileId || this.pinOverlayRenderState?.profileId;
+    return this.getProfileById(profileId);
+  },
+
+  getRenderedPinOverlayState() {
+    return this.pinOverlayRenderState || this.pinOverlayState;
+  },
+
+  renderPinBoxes() {
+    const isError = Boolean(this.pinOverlayError);
+    return Array.from({ length: PROFILE_PIN_LENGTH }, (_, index) => {
+      const isFilled = index < this.pinValue.length;
+      const isActive = index === Math.min(this.pinValue.length, PROFILE_PIN_LENGTH - 1)
+        && this.pinValue.length < PROFILE_PIN_LENGTH
+        && !this.isPinOperationInProgress;
+      return `
+        <span class="profile-pin-box${isFilled ? " is-filled" : ""}${isActive ? " is-active" : ""}${isError ? " is-error" : ""}" aria-hidden="true">
+          <span class="profile-pin-dot"></span>
+          <span class="profile-pin-cursor"></span>
+        </span>
+      `;
+    }).join("");
+  },
+
+  renderPinOverlay() {
+    const state = this.getRenderedPinOverlayState();
+    const profile = this.getPinOverlayProfile();
+    if (!state || !profile) {
+      return "";
+    }
+    const phaseClass = this.pinOverlayPhase === "closing"
+      ? " is-closing"
+      : this.pinOverlayPhase === "opening"
+        ? " is-opening"
+        : " is-open";
+
+    const isSingleEntryMode = state.type !== "set";
+    let heading = PROFILE_PIN_TEXT.headingSet(profile.name);
+    let support = PROFILE_PIN_TEXT.supportSet;
+
+    if (state.type === "unlock") {
+      heading = PROFILE_PIN_TEXT.headingUnlock(profile.name);
+      support = PROFILE_PIN_TEXT.supportUnlock;
+    } else if (state.type === "verify-change") {
+      heading = PROFILE_PIN_TEXT.headingVerifyChange(profile.name);
+      support = PROFILE_PIN_TEXT.supportVerifyChange;
+    } else if (state.type === "verify-remove") {
+      heading = PROFILE_PIN_TEXT.headingVerifyRemove(profile.name);
+      support = PROFILE_PIN_TEXT.supportVerifyRemove;
+    } else if (this.pinEntryStage === "confirm") {
+      heading = PROFILE_PIN_TEXT.headingConfirm;
+      support = PROFILE_PIN_TEXT.supportConfirm;
+    }
+
+    if (this.pinOverlayError) {
+      support = this.pinOverlayError;
+    } else if (this.isPinOperationInProgress) {
+      support = isSingleEntryMode ? PROFILE_PIN_TEXT.verifying : PROFILE_PIN_TEXT.saving;
+    }
+
+    return `
+      <div class="profile-pin-layer${phaseClass}">
+        <div class="profile-pin-overlay profile-focusable focusable" data-overlay-root="pin" data-focus-key="pin:root" tabindex="0">
+          <div class="profile-pin-content">
+            <div class="profile-pin-heading">${escapeHtml(heading)}</div>
+            <div class="profile-pin-box-row" data-role="pin-box-row">${this.renderPinBoxes()}</div>
+            <div class="profile-pin-support${this.pinOverlayError ? " is-error" : ""}">${escapeHtml(support)}</div>
+            ${isSingleEntryMode ? `<div class="profile-pin-forgot">${escapeHtml(PROFILE_PIN_TEXT.forgot)}</div>` : ""}
+            <div class="profile-pin-back-hint">${escapeHtml(PROFILE_PIN_TEXT.back)}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  },
+
+  renderPinActionToast() {
+    if (!this.pinActionMessage) {
+      return "";
+    }
+    return `
+      <div class="profile-pin-toast" role="status" aria-live="polite">
+        ${escapeHtml(this.pinActionMessage)}
       </div>
     `;
   },
@@ -432,9 +673,22 @@ export const ProfileSelectionScreen = {
       node.addEventListener("focus", () => this.handleFocusableFocus(node));
       node.addEventListener("click", async (event) => {
         event.stopPropagation();
+        if (this.shouldIgnoreKeyboardClick(node)) {
+          event.preventDefault();
+          return;
+        }
         await this.activateFocusedNode(node);
       });
     });
+
+    const pinOverlay = this.container.querySelector(".profile-pin-overlay");
+    if (pinOverlay) {
+      pinOverlay.addEventListener("focus", () => this.handleFocusableFocus(pinOverlay));
+      pinOverlay.addEventListener("click", (event) => {
+        event.stopPropagation();
+        pinOverlay.focus();
+      });
+    }
 
     const nameInput = this.container.querySelector("[data-role='editor-name-input']");
     if (nameInput) {
@@ -469,10 +723,19 @@ export const ProfileSelectionScreen = {
         }
       });
     });
+
+    const pinBackdrop = this.container.querySelector(".profile-pin-layer");
+    if (pinBackdrop && pinOverlay) {
+      pinBackdrop.addEventListener("click", (event) => {
+        if (event.target === pinBackdrop) {
+          pinOverlay.focus();
+        }
+      });
+    }
   },
 
   handleFocusableFocus(node) {
-    Array.from(this.container.querySelectorAll(".profile-focusable.focused, .profile-overlay-focusable.focused")).forEach((entry) => {
+    Array.from(this.container.querySelectorAll(".profile-focusable.focused, .profile-overlay-focusable.focused, .profile-pin-overlay.focused")).forEach((entry) => {
       if (entry !== node) {
         entry.classList.remove("focused");
       }
@@ -488,11 +751,11 @@ export const ProfileSelectionScreen = {
       const profile = this.getProfileById(profileId);
       if (profile) {
         this.lastProfileFocusKey = `profile:${profile.id}`;
-        this.updateBackground(profile.avatarColorHex || DEFAULT_PROFILE_COLOR);
+        this.updateBackground(profile.avatarColorHex || getDefaultProfileColor());
       }
     } else if (profileId === "add") {
       this.lastProfileFocusKey = "profile:add";
-      this.updateBackground("#555555");
+      this.updateBackground(getDefaultProfileColor());
     }
 
     if (avatarId && this.editorState) {
@@ -515,7 +778,7 @@ export const ProfileSelectionScreen = {
     const target = this.findFocusableByKey(this.pendingFocusKey || defaultFocusKey || this.focusKey);
     this.pendingFocusKey = "";
     if (!target) {
-      const fallback = this.container.querySelector(".profile-card, .profile-overlay-focusable, .profile-dialog-button");
+      const fallback = this.container.querySelector(".profile-pin-overlay, .profile-card, .profile-overlay-focusable, .profile-dialog-button");
       if (!fallback) {
         return;
       }
@@ -528,6 +791,9 @@ export const ProfileSelectionScreen = {
   },
 
   getDefaultFocusKey() {
+    if (this.pinOverlayState) {
+      return "pin:root";
+    }
     if (this.deleteProfileId) {
       return "delete:confirm";
     }
@@ -554,11 +820,200 @@ export const ProfileSelectionScreen = {
       .find((node) => String(node.dataset.focusKey || "") === String(focusKey)) || null;
   },
 
+  rememberKeyboardActivation(node) {
+    const focusKey = String(node?.dataset?.focusKey || "");
+    if (!focusKey) {
+      this.lastKeyboardActivation = null;
+      return;
+    }
+    this.lastKeyboardActivation = {
+      focusKey,
+      at: Date.now()
+    };
+  },
+
+  shouldIgnoreKeyboardClick(node) {
+    const suppressedFocusClick = this.suppressedFocusClick;
+    if (suppressedFocusClick && (Date.now() - Number(suppressedFocusClick.at || 0)) <= 400) {
+      if (String(node?.dataset?.focusKey || "") === String(suppressedFocusClick.focusKey || "")) {
+        this.suppressedFocusClick = null;
+        return true;
+      }
+    }
+    this.suppressedFocusClick = null;
+    const recentActivation = this.lastKeyboardActivation;
+    this.lastKeyboardActivation = null;
+    if (!recentActivation) {
+      return false;
+    }
+    if ((Date.now() - Number(recentActivation.at || 0)) > 300) {
+      return false;
+    }
+    return String(node?.dataset?.focusKey || "") === String(recentActivation.focusKey || "");
+  },
+
+  suppressNextFocusClick(focusKey) {
+    const normalizedFocusKey = String(focusKey || "");
+    if (!normalizedFocusKey) {
+      this.suppressedFocusClick = null;
+      return;
+    }
+    this.suppressedFocusClick = {
+      focusKey: normalizedFocusKey,
+      at: Date.now()
+    };
+  },
+
+  getEditorNavigationState() {
+    const overlayRoot = this.container?.querySelector("[data-overlay-root='editor']");
+    if (!overlayRoot) {
+      return null;
+    }
+    return {
+      overlayRoot,
+      submitButton: overlayRoot.querySelector("[data-focus-key='editor:submit']"),
+      nameInput: overlayRoot.querySelector("[data-focus-key='editor:name']"),
+      cancelButton: overlayRoot.querySelector("[data-focus-key='editor:cancel']"),
+      categoryButtons: Array.from(overlayRoot.querySelectorAll("[data-action='select-avatar-category']")),
+      avatarButtons: Array.from(overlayRoot.querySelectorAll("[data-action='select-avatar']"))
+    };
+  },
+
+  getPreferredEditorCategoryButton(navigationState) {
+    return navigationState?.categoryButtons.find((node) => node.classList.contains("is-selected"))
+      || navigationState?.categoryButtons[0]
+      || null;
+  },
+
+  getEditorCategoryButtonForAvatar(navigationState, avatarId) {
+    const avatar = this.avatarCatalog.find((entry) => entry.id === avatarId) || null;
+    const avatarCategory = String(avatar?.category || "").trim().toLowerCase();
+    if (!avatarCategory) {
+      return null;
+    }
+    return navigationState?.categoryButtons.find((node) => String(node.dataset.category || "") === avatarCategory) || null;
+  },
+
+  getPreferredEditorAvatarButton(navigationState, referenceNode = null) {
+    const avatarButtons = navigationState?.avatarButtons || [];
+    if (!avatarButtons.length) {
+      return null;
+    }
+    return avatarButtons.find((node) => node.classList.contains("is-selected"))
+      || findNearestByHorizontalCenter(referenceNode, avatarButtons)
+      || avatarButtons[0]
+      || null;
+  },
+
+  getAvatarGridPosition(navigationState, node) {
+    const rows = buildVisualRows(navigationState?.avatarButtons || []);
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const columnIndex = rows[rowIndex].nodes.indexOf(node);
+      if (columnIndex !== -1) {
+        return {
+          rows,
+          rowIndex,
+          columnIndex,
+          rowNodes: rows[rowIndex].nodes
+        };
+      }
+    }
+    return null;
+  },
+
+  moveEditorFocus(event, overlayRoot) {
+    const code = Number(event?.keyCode || 0);
+    const direction = code === 38 ? "up"
+      : code === 40 ? "down"
+        : code === 37 ? "left"
+          : code === 39 ? "right"
+            : null;
+    if (!direction) {
+      return false;
+    }
+
+    const navigationState = this.getEditorNavigationState();
+    if (!navigationState) {
+      return false;
+    }
+
+    const current = overlayRoot.querySelector(".profile-overlay-focusable.focused") || document.activeElement;
+    if (!current) {
+      return false;
+    }
+
+    const preferredCategoryButton = this.getPreferredEditorCategoryButton(navigationState);
+    let target = null;
+
+    if (current === navigationState.submitButton) {
+      if (direction === "left") {
+        target = navigationState.nameInput;
+      } else if (direction === "down" || direction === "right") {
+        target = preferredCategoryButton;
+      }
+    } else if (current === navigationState.nameInput) {
+      if (direction === "up") {
+        target = navigationState.submitButton;
+      } else if (direction === "down") {
+        target = navigationState.cancelButton || preferredCategoryButton;
+      } else if (direction === "right") {
+        target = preferredCategoryButton;
+      }
+    } else if (current === navigationState.cancelButton) {
+      if (direction === "up") {
+        target = navigationState.nameInput;
+      } else if (direction === "right" || direction === "down") {
+        target = preferredCategoryButton;
+      } else if (direction === "left") {
+        target = navigationState.nameInput;
+      }
+    } else if (current.matches?.("[data-action='select-avatar-category']")) {
+      const index = navigationState.categoryButtons.indexOf(current);
+      if (direction === "left") {
+        target = index > 0 ? navigationState.categoryButtons[index - 1] : navigationState.cancelButton;
+      } else if (direction === "right") {
+        target = navigationState.categoryButtons[index + 1] || null;
+      } else if (direction === "up") {
+        target = navigationState.submitButton;
+      } else if (direction === "down") {
+        target = this.getPreferredEditorAvatarButton(navigationState, current);
+      }
+    } else if (current.matches?.("[data-action='select-avatar']")) {
+      const position = this.getAvatarGridPosition(navigationState, current);
+      if (!position) {
+        return false;
+      }
+      if (direction === "left") {
+        target = position.rowNodes[position.columnIndex - 1] || navigationState.cancelButton;
+      } else if (direction === "right") {
+        target = position.rowNodes[position.columnIndex + 1] || null;
+      } else if (direction === "up") {
+        const previousRow = position.rows[position.rowIndex - 1];
+        target = previousRow
+          ? findNearestByHorizontalCenter(current, previousRow.nodes)
+          : preferredCategoryButton
+            || this.getEditorCategoryButtonForAvatar(navigationState, current.dataset.avatarId)
+            || findNearestByHorizontalCenter(current, navigationState.categoryButtons);
+      } else if (direction === "down") {
+        const nextRow = position.rows[position.rowIndex + 1];
+        target = nextRow ? findNearestByHorizontalCenter(current, nextRow.nodes) : null;
+      }
+    }
+
+    if (!target) {
+      return false;
+    }
+
+    event?.preventDefault?.();
+    target.focus();
+    return true;
+  },
+
   buildBackgroundStyle(colorHex) {
     const rootStyles = getComputedStyle(document.documentElement);
     const background = parseHexColor(rootStyles.getPropertyValue("--bg-color"), { r: 13, g: 13, b: 13 });
     const elevated = parseHexColor(rootStyles.getPropertyValue("--bg-elevated"), { r: 26, g: 26, b: 26 });
-    const accent = parseHexColor(colorHex, parseHexColor(DEFAULT_PROFILE_COLOR));
+    const accent = parseHexColor(colorHex, parseHexColor(getDefaultProfileColor()));
     const gradientTop = mixColors(elevated, accent, 0.3);
     const gradientMid = mixColors(background, accent, 0.14);
     return `
@@ -607,9 +1062,9 @@ export const ProfileSelectionScreen = {
       profileId: null,
       originalName: "",
       name: "",
-      selectedColorHex: DEFAULT_PROFILE_COLOR,
+      selectedColorHex: getDefaultProfileColor(),
       selectedAvatarId: null,
-      baseColorHex: DEFAULT_PROFILE_COLOR,
+      baseColorHex: getDefaultProfileColor(),
       category: "all",
       focusedAvatarName: null
     };
@@ -628,9 +1083,9 @@ export const ProfileSelectionScreen = {
       profileId: String(profile.id),
       originalName: String(profile.name || ""),
       name: String(profile.name || ""),
-      selectedColorHex: String(profile.avatarColorHex || DEFAULT_PROFILE_COLOR),
+      selectedColorHex: String(profile.avatarColorHex || getDefaultProfileColor()),
       selectedAvatarId: profile.avatarId || null,
-      baseColorHex: String(profile.avatarColorHex || DEFAULT_PROFILE_COLOR),
+      baseColorHex: String(profile.avatarColorHex || getDefaultProfileColor()),
       category: "all",
       focusedAvatarName: null
     };
@@ -652,7 +1107,77 @@ export const ProfileSelectionScreen = {
     this.deleteProfileId = null;
     this.optionsProfileId = String(profile.id);
     this.pendingFocusKey = "options:edit";
+    this.suppressNextFocusClick("options:edit");
     this.render();
+  },
+
+  canHoldManageProfile(node) {
+    return !this.isManagementMode
+      && Boolean(node?.matches?.(".profile-card.focused, .profile-card"))
+      && String(node?.dataset?.profileId || "") !== "add";
+  },
+
+  cancelPendingProfileHold() {
+    if (this.pendingProfileHoldTimer) {
+      clearTimeout(this.pendingProfileHoldTimer);
+      this.pendingProfileHoldTimer = null;
+    }
+    this.pendingProfileHoldTarget = null;
+  },
+
+  hasPendingProfileHold(node) {
+    const pending = this.pendingProfileHoldTarget;
+    if (!pending || !node) {
+      return false;
+    }
+    return String(node.dataset.profileId || "") === String(pending.profileId || "");
+  },
+
+  startPendingProfileHold(node) {
+    const profileId = String(node?.dataset?.profileId || "");
+    if (!profileId || profileId === "add") {
+      return false;
+    }
+    this.cancelPendingProfileHold();
+    this.pendingProfileHoldTarget = {
+      profileId,
+      holdTriggered: false
+    };
+    this.pendingProfileHoldTimer = setTimeout(() => {
+      this.pendingProfileHoldTimer = null;
+      const pending = this.pendingProfileHoldTarget;
+      if (!pending || Router.getCurrent() !== "profileSelection") {
+        return;
+      }
+      const current = this.container?.querySelector(".profile-card.focused") || null;
+      if (!this.hasPendingProfileHold(current)) {
+        return;
+      }
+      const profile = this.getProfileById(pending.profileId);
+      if (!profile) {
+        return;
+      }
+      pending.holdTriggered = true;
+      this.openOptionsDialog(profile);
+    }, PROFILE_HOLD_DELAY_MS);
+    return true;
+  },
+
+  async completePendingProfileHold(node) {
+    const pending = this.pendingProfileHoldTarget;
+    if (!pending) {
+      return false;
+    }
+    const holdTriggered = Boolean(pending.holdTriggered);
+    this.cancelPendingProfileHold();
+    if (holdTriggered) {
+      return true;
+    }
+    if (!node) {
+      return false;
+    }
+    await this.activateFocusedNode(node);
+    return true;
   },
 
   closeOptionsDialog() {
@@ -660,6 +1185,254 @@ export const ProfileSelectionScreen = {
     this.optionsProfileId = null;
     this.pendingFocusKey = profileId ? `profile:${profileId}` : (this.lastProfileFocusKey || "profile:1");
     this.render();
+  },
+
+  openPinOverlay(type, profile, currentPin = null) {
+    if (!profile) {
+      return;
+    }
+    if (this.pinTransitionTimer) {
+      clearTimeout(this.pinTransitionTimer);
+      this.pinTransitionTimer = null;
+    }
+    this.pinTransitionCallback = null;
+    this.editorState = null;
+    this.optionsProfileId = null;
+    this.deleteProfileId = null;
+    this.pinOverlayState = {
+      type,
+      profileId: String(profile.id),
+      currentPin: currentPin ? String(currentPin) : null
+    };
+    this.pinOverlayRenderState = this.pinOverlayState;
+    this.pinOverlayPhase = "opening";
+    this.pinOverlayError = "";
+    this.pinEntryStage = "create";
+    this.pinValue = "";
+    this.pinDraftValue = "";
+    this.pendingFocusKey = "pin:root";
+    this.render();
+    this.pinTransitionTimer = setTimeout(() => {
+      this.pinTransitionTimer = null;
+      if (!this.pinOverlayState) {
+        return;
+      }
+      this.pinOverlayRenderState = this.pinOverlayState;
+      this.pinOverlayPhase = "open";
+      this.render();
+    }, PROFILE_PIN_OPEN_MS);
+  },
+
+  closePinOverlay({ focusKey = "", afterClose = null } = {}) {
+    if (this.pinOverlayPhase === "closing") {
+      return;
+    }
+    const renderState = this.pinOverlayState || this.pinOverlayRenderState;
+    const profileId = renderState?.profileId;
+    if (!renderState) {
+      return;
+    }
+    if (this.pinTransitionTimer) {
+      clearTimeout(this.pinTransitionTimer);
+      this.pinTransitionTimer = null;
+    }
+    this.pinTransitionCallback = typeof afterClose === "function" ? afterClose : null;
+    this.pinOverlayState = null;
+    this.pinOverlayRenderState = renderState;
+    this.pinOverlayPhase = "closing";
+    this.isPinOperationInProgress = false;
+    this.pendingFocusKey = focusKey || (profileId ? `profile:${profileId}` : (this.lastProfileFocusKey || "profile:1"));
+    this.render();
+    this.pinTransitionTimer = setTimeout(async () => {
+      const callback = this.pinTransitionCallback;
+      this.pinTransitionTimer = null;
+      this.pinTransitionCallback = null;
+      this.pinOverlayRenderState = null;
+      this.pinOverlayPhase = "closed";
+      this.pinOverlayError = "";
+      this.pinEntryStage = "create";
+      this.pinValue = "";
+      this.pinDraftValue = "";
+      this.render();
+      if (callback) {
+        await callback();
+      }
+    }, PROFILE_PIN_CLOSE_MS);
+  },
+
+  setPinActionMessage(message) {
+    if (this.pinActionMessageTimer) {
+      clearTimeout(this.pinActionMessageTimer);
+      this.pinActionMessageTimer = null;
+    }
+    this.pinActionMessage = String(message || "");
+    if (!this.pinActionMessage) {
+      this.render();
+      return;
+    }
+    this.render();
+    this.pinActionMessageTimer = setTimeout(() => {
+      this.pinActionMessageTimer = null;
+      this.pinActionMessage = "";
+      this.render();
+    }, 2600);
+  },
+
+  triggerPinShake() {
+    const row = this.container?.querySelector("[data-role='pin-box-row']");
+    if (!row) {
+      return;
+    }
+    row.classList.remove("is-shaking");
+    void row.offsetWidth;
+    row.classList.add("is-shaking");
+  },
+
+  async submitCompletedPin(pin) {
+    const state = this.pinOverlayState;
+    const profile = this.getPinOverlayProfile();
+    if (!state || !profile || this.isPinOperationInProgress) {
+      return;
+    }
+
+    this.isPinOperationInProgress = true;
+    this.render();
+
+    if (state.type === "set") {
+      const success = await ProfileSyncService.setProfilePin(profile.id, pin, state.currentPin);
+      this.isPinOperationInProgress = false;
+      if (success) {
+        this.profilePinEnabled = {
+          ...this.profilePinEnabled,
+          [String(profile.id)]: true
+        };
+        this.pinOverlayError = "";
+        this.setPinActionMessage(PROFILE_PIN_TEXT.saved(profile.name));
+        this.closePinOverlay({ focusKey: `profile:${profile.id}` });
+        return;
+      }
+      this.pinOverlayError = PROFILE_PIN_TEXT.saveFailed;
+      this.pinValue = "";
+      this.render();
+      this.triggerPinShake();
+      return;
+    }
+
+    if (state.type === "verify-remove") {
+      const success = await ProfileSyncService.clearProfilePin(profile.id, pin);
+      this.isPinOperationInProgress = false;
+      if (success) {
+        this.profilePinEnabled = {
+          ...this.profilePinEnabled,
+          [String(profile.id)]: false
+        };
+        this.pinOverlayError = "";
+        this.setPinActionMessage(PROFILE_PIN_TEXT.removed(profile.name));
+        this.closePinOverlay({ focusKey: `profile:${profile.id}` });
+        return;
+      }
+      this.pinOverlayError = PROFILE_PIN_TEXT.incorrectCurrent;
+      this.pinValue = "";
+      this.render();
+      this.triggerPinShake();
+      return;
+    }
+
+    const verification = await ProfileSyncService.verifyProfilePin(profile.id, pin);
+    this.isPinOperationInProgress = false;
+    if (!verification) {
+      this.pinOverlayError = PROFILE_PIN_TEXT.verifyFailed;
+      this.pinValue = "";
+      this.render();
+      this.triggerPinShake();
+      return;
+    }
+
+    if (verification.unlocked) {
+      if (state.type === "unlock") {
+        this.pinOverlayError = "";
+        this.isPinOperationInProgress = true;
+        this.render();
+        try {
+          await this.activateProfile(profile.id);
+        } finally {
+          this.isPinOperationInProgress = false;
+        }
+        return;
+      }
+      if (state.type === "verify-change") {
+        this.openPinOverlay("set", profile, pin);
+        return;
+      }
+    }
+
+    this.pinOverlayError = verification.retryAfterSeconds > 0
+      ? PROFILE_PIN_TEXT.lockedRetry(verification.retryAfterSeconds)
+      : (state.type === "unlock" ? PROFILE_PIN_TEXT.invalidPin : PROFILE_PIN_TEXT.incorrectCurrent);
+    this.pinValue = "";
+    this.render();
+    this.triggerPinShake();
+  },
+
+  async handleCompletedPinEntry() {
+    if (this.pinValue.length !== PROFILE_PIN_LENGTH || this.isPinOperationInProgress || !this.pinOverlayState) {
+      return;
+    }
+    if (this.pinOverlayState.type !== "set") {
+      await this.submitCompletedPin(this.pinValue);
+      return;
+    }
+    if (this.pinEntryStage === "create") {
+      this.pinDraftValue = this.pinValue;
+      this.pinValue = "";
+      this.pinOverlayError = "";
+      this.pinEntryStage = "confirm";
+      this.render();
+      return;
+    }
+    if (this.pinDraftValue === this.pinValue) {
+      await this.submitCompletedPin(this.pinValue);
+      return;
+    }
+    this.pinValue = "";
+    this.pinDraftValue = "";
+    this.pinEntryStage = "create";
+    this.pinOverlayError = PROFILE_PIN_TEXT.mismatch;
+    this.render();
+    this.triggerPinShake();
+  },
+
+  async handlePinOverlayKeyDown(event) {
+    const code = Number(event?.keyCode || 0);
+    const key = String(event?.key || "");
+    if (code === 8 || code === 46 || key === "Backspace" || key === "Delete") {
+      event?.preventDefault?.();
+      if (!this.isPinOperationInProgress && this.pinValue) {
+        this.pinValue = this.pinValue.slice(0, -1);
+        this.pinOverlayError = "";
+        this.render();
+      }
+      return true;
+    }
+    if (code === 27 || code === 461 || code === 10009 || key === "Escape") {
+      event?.preventDefault?.();
+      this.closePinOverlay();
+      return true;
+    }
+    if ([37, 38, 39, 40, 13].includes(code)) {
+      event?.preventDefault?.();
+      return true;
+    }
+    const digit = keyEventToDigit(event);
+    if (!digit || this.isPinOperationInProgress || this.pinValue.length >= PROFILE_PIN_LENGTH) {
+      return false;
+    }
+    event?.preventDefault?.();
+    this.pinValue += digit;
+    this.pinOverlayError = "";
+    this.render();
+    await this.handleCompletedPinEntry();
+    return true;
   },
 
   openDeleteDialog(profile) {
@@ -704,19 +1477,20 @@ export const ProfileSelectionScreen = {
       success = await ProfileManager.updateProfile({
         ...existing,
         name: trimmedName,
-        avatarColorHex: editorState.selectedColorHex || DEFAULT_PROFILE_COLOR,
+        avatarColorHex: editorState.selectedColorHex || getDefaultProfileColor(),
         avatarId: editorState.selectedAvatarId || null
       });
     } else {
       success = await ProfileManager.createProfile({
         name: trimmedName,
-        avatarColorHex: editorState.selectedColorHex || DEFAULT_PROFILE_COLOR,
+        avatarColorHex: editorState.selectedColorHex || getDefaultProfileColor(),
         avatarId: editorState.selectedAvatarId || null
       });
     }
 
     if (success !== false) {
       await ProfileSyncService.push();
+      await this.refreshProfilePinStates();
     }
     await this.reloadProfiles(`profile:${focusProfileId}`);
   },
@@ -732,7 +1506,9 @@ export const ProfileSelectionScreen = {
 
     const deleted = await ProfileManager.deleteProfile(profile.id);
     if (deleted !== false) {
+      await ProfileSyncService.deleteProfileData(profile.id);
       await ProfileSyncService.push();
+      await this.refreshProfilePinStates();
     }
 
     const remainingProfiles = await ProfileManager.getProfiles();
@@ -746,6 +1522,7 @@ export const ProfileSelectionScreen = {
 
   async reloadProfiles(focusKey = "") {
     this.profiles = await ProfileManager.getProfiles();
+    await this.refreshProfilePinStates();
     this.activeProfileId = String(ProfileManager.getActiveProfileId() || this.activeProfileId || "1");
     this.pendingFocusKey = focusKey;
     this.render();
@@ -777,11 +1554,11 @@ export const ProfileSelectionScreen = {
       if (this.editorState.selectedAvatarId === avatar.id) {
         this.editorState.selectedAvatarId = null;
         this.editorState.selectedColorHex = this.editorState.mode === "edit"
-          ? this.editorState.baseColorHex || DEFAULT_PROFILE_COLOR
-          : DEFAULT_PROFILE_COLOR;
+          ? this.editorState.baseColorHex || getDefaultProfileColor()
+          : getDefaultProfileColor();
       } else {
         this.editorState.selectedAvatarId = avatar.id;
-        this.editorState.selectedColorHex = avatar.bgColor || DEFAULT_PROFILE_COLOR;
+        this.editorState.selectedColorHex = avatar.bgColor || getDefaultProfileColor();
       }
       this.editorState.focusedAvatarName = avatar.displayName;
       this.pendingFocusKey = `editor:avatar:${avatar.id}`;
@@ -790,6 +1567,20 @@ export const ProfileSelectionScreen = {
     }
     if (action === "open-edit-profile") {
       this.openEditEditor(this.getProfileById(profileId));
+      return;
+    }
+    if (action === "open-profile-pin") {
+      const profile = this.getProfileById(profileId);
+      if (profile) {
+        this.openPinOverlay(this.isProfilePinEnabled(profile.id) ? "verify-change" : "set", profile);
+      }
+      return;
+    }
+    if (action === "remove-profile-pin") {
+      const profile = this.getProfileById(profileId);
+      if (profile) {
+        this.openPinOverlay("verify-remove", profile);
+      }
       return;
     }
     if (action === "confirm-delete-profile") {
@@ -816,6 +1607,11 @@ export const ProfileSelectionScreen = {
       return;
     }
 
+    if (this.isProfilePinEnabled(profile.id)) {
+      this.openPinOverlay("unlock", profile);
+      return;
+    }
+
     await this.activateProfile(profile.id);
   },
 
@@ -835,16 +1631,29 @@ export const ProfileSelectionScreen = {
 
     const code = Number(event?.keyCode || 0);
     const originalKeyCode = Number(event?.originalKeyCode || code || 0);
-    const overlayRoot = this.container.querySelector("[data-overlay-root='delete']")
+    const overlayRoot = this.container.querySelector("[data-overlay-root='pin']")
+      || this.container.querySelector("[data-overlay-root='delete']")
       || this.container.querySelector("[data-overlay-root='options']")
       || this.container.querySelector("[data-overlay-root='editor']");
+    const currentProfileCard = this.container.querySelector(".profile-card.focused") || null;
+
+    if (!Platform.isTizen() || code !== 13 || !this.canHoldManageProfile(currentProfileCard)) {
+      this.cancelPendingProfileHold();
+    }
 
     if (overlayRoot) {
-      const overlaySelector = overlayRoot.dataset.overlayRoot === "editor"
+      this.cancelPendingProfileHold();
+      if (overlayRoot.dataset.overlayRoot === "pin") {
+        await this.handlePinOverlayKeyDown(event);
+        return;
+      }
+      const isEditorOverlay = overlayRoot.dataset.overlayRoot === "editor";
+      const overlaySelector = isEditorOverlay
         ? ".profile-overlay-focusable:not(.is-disabled)"
         : ".profile-dialog-button";
 
-      if (ScreenUtils.handleDpadNavigation(event, overlayRoot, overlaySelector)) {
+      if ((isEditorOverlay && this.moveEditorFocus(event, overlayRoot))
+        || (!isEditorOverlay && ScreenUtils.handleDpadNavigation(event, overlayRoot, overlaySelector))) {
         return;
       }
 
@@ -856,6 +1665,8 @@ export const ProfileSelectionScreen = {
       if (!focused || (isTextInput(focused) && overlayRoot.dataset.overlayRoot === "editor")) {
         return;
       }
+      event?.preventDefault?.();
+      this.rememberKeyboardActivation(focused);
       await this.activateFocusedNode(focused);
       return;
     }
@@ -864,7 +1675,7 @@ export const ProfileSelectionScreen = {
       && ((code === 13 && event?.repeat) || originalKeyCode === 82 || code === 93);
 
     if (wantsManageOptions) {
-      const current = this.container.querySelector(".profile-card.focused");
+      const current = currentProfileCard;
       const profileId = current?.dataset?.profileId;
       if (profileId && profileId !== "add") {
         const profile = this.getProfileById(profileId);
@@ -874,6 +1685,14 @@ export const ProfileSelectionScreen = {
           return;
         }
       }
+    }
+
+    if (Platform.isTizen() && code === 13 && this.canHoldManageProfile(currentProfileCard)) {
+      event?.preventDefault?.();
+      if (!event?.repeat && !this.hasPendingProfileHold(currentProfileCard)) {
+        this.startPendingProfileHold(currentProfileCard);
+      }
+      return;
     }
 
     if (ScreenUtils.handleDpadNavigation(event, this.container, ".profile-card")) {
@@ -888,10 +1707,28 @@ export const ProfileSelectionScreen = {
     if (!current) {
       return;
     }
+    this.rememberKeyboardActivation(current);
     await this.activateFocusedNode(current);
   },
 
+  async onKeyUp(event) {
+    if (!Platform.isTizen()) {
+      return;
+    }
+    if (Number(event?.keyCode || 0) !== 13 || this.pinOverlayState || this.optionsProfileId || this.deleteProfileId || this.editorState) {
+      return;
+    }
+    const current = this.container?.querySelector(".profile-card.focused") || null;
+    if (await this.completePendingProfileHold(current)) {
+      event?.preventDefault?.();
+    }
+  },
+
   consumeBackRequest() {
+    if (this.pinOverlayState) {
+      this.closePinOverlay();
+      return true;
+    }
     if (this.deleteProfileId) {
       this.closeDeleteDialog();
       return true;
@@ -904,10 +1741,24 @@ export const ProfileSelectionScreen = {
       this.closeEditor();
       return true;
     }
+    if (!this.isManagementMode) {
+      return true;
+    }
     return false;
   },
 
   cleanup() {
+    this.cancelPendingProfileHold();
+    if (this.pinActionMessageTimer) {
+      clearTimeout(this.pinActionMessageTimer);
+      this.pinActionMessageTimer = null;
+    }
+    if (this.pinTransitionTimer) {
+      clearTimeout(this.pinTransitionTimer);
+      this.pinTransitionTimer = null;
+    }
+    this.pinTransitionCallback = null;
+    this.suppressedFocusClick = null;
     const container = document.getElementById("profileSelection");
     if (!container) {
       return;

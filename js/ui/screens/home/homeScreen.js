@@ -50,6 +50,7 @@ const CW_DAYS_CAP = 60;
 const CW_PROGRESS_START_THRESHOLD = 0.02;
 const CW_PROGRESS_END_THRESHOLD = 0.85;
 const CW_ENTER_DELAY_MS = 320;
+const CW_HOLD_DELAY_MS = 650;
 const HOME_INITIAL_CATALOG_LOAD = 10;
 const HOME_MAX_ITEMS_PER_ROW_DEFAULT = 15;
 const HOME_MAX_ITEMS_PER_ROW_CONSTRAINED = 10;
@@ -285,55 +286,14 @@ function buildYoutubeEmbedUrl(videoId, { muted = true } = {}) {
     proxyUrl.searchParams.set("playlist", cleanId);
     proxyUrl.searchParams.set("playsinline", "1");
     proxyUrl.searchParams.set("rel", "0");
+    proxyUrl.searchParams.set("_cb", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     return proxyUrl.toString();
   } catch (_) {
     return "";
   }
 }
 
-function scoreTrailerStream(entry = {}) {
-  const text = [
-    entry?.quality,
-    entry?.label,
-    entry?.name,
-    entry?.title,
-    entry?.description,
-    entry?.resolution
-  ].map((value) => String(value || "")).join(" ").toLowerCase();
-  const width = Number(entry?.width || 0);
-  const height = Number(entry?.height || entry?.resolutionHeight || 0);
-  const bitrate = Number(entry?.bitrate || 0);
-  let score = 0;
-
-  if (width >= 3840 || height >= 2160 || /2160|4k|uhd/.test(text)) score += 120;
-  else if (width >= 2560 || height >= 1440 || /1440|2k|qhd/.test(text)) score += 90;
-  else if (width >= 1920 || height >= 1080 || /1080|full\s*hd|fhd/.test(text)) score += 70;
-  else if (width >= 1280 || height >= 720 || /720|hd\b/.test(text)) score += 45;
-  else if (width > 0 || height > 0) score += 20;
-
-  score += Math.max(0, Math.min(20, Math.round(bitrate / 500000)));
-
-  if (/hdr|dolby/.test(text)) score += 8;
-  if (/hevc|h265|av1/.test(text)) score += 6;
-
-  return score;
-}
-
 function resolveTrailerSource(meta = {}) {
-  const trailerStreams = Array.isArray(meta?.trailerStreams) ? meta.trailerStreams : [];
-  const directVideo = trailerStreams
-    .filter((entry) => {
-      const url = String(entry?.url || entry?.videoUrl || entry?.stream || "").trim();
-      return /^https?:\/\//i.test(url);
-    })
-    .sort((left, right) => scoreTrailerStream(right) - scoreTrailerStream(left))[0];
-  if (directVideo) {
-    return {
-      kind: "video",
-      url: String(directVideo.url || directVideo.videoUrl || directVideo.stream || "").trim()
-    };
-  }
-
   const trailerCandidates = [
     ...(Array.isArray(meta?.trailers) ? meta.trailers : []),
     ...(Array.isArray(meta?.videos) ? meta.videos : [])
@@ -359,7 +319,6 @@ function resolveTrailerSource(meta = {}) {
       };
     }
   }
-
   const fallbackId = resolveYoutubeId(Array.isArray(meta?.trailerYtIds) ? meta.trailerYtIds[0] : "");
   if (!fallbackId) {
     return null;
@@ -377,10 +336,6 @@ function resolveTrailerSource(meta = {}) {
 
 function applyTrailerAudioPreferences(source, prefs = {}) {
   if (!source) {
-    return null;
-  }
-  const isTvYoutubeEmbed = (Platform.isWebOS() || Platform.isTizen()) && source.kind === "youtube";
-  if (isTvYoutubeEmbed) {
     return null;
   }
   const muted = Boolean(prefs.focusedPosterBackdropTrailerMuted);
@@ -416,6 +371,44 @@ function withTimeout(promise, ms, fallbackValue) {
       clearTimeout(timer);
     }
   });
+}
+
+async function resolveTrailerMetaWithTmdbFallback(meta = {}, itemType = "movie") {
+  const fallbackSource = resolveTrailerSource(meta);
+  if (fallbackSource) {
+    return fallbackSource;
+  }
+  const settings = TmdbSettingsStore.get();
+  if (!settings.enabled || !settings.apiKey) {
+    return fallbackSource;
+  }
+  try {
+    const tmdbId = await withTimeout(TmdbService.ensureTmdbId(meta?.id, itemType), 1800, null);
+    if (!tmdbId) {
+      return null;
+    }
+    const enrichment = await withTimeout(TmdbMetadataService.fetchEnrichment({
+      tmdbId,
+      contentType: itemType,
+      language: settings.language
+    }), 2200, null);
+    if (!enrichment) {
+      return fallbackSource;
+    }
+    const mergedMeta = {
+      ...meta,
+      trailers: Array.isArray(meta?.trailers) && meta.trailers.length
+        ? meta.trailers
+        : (Array.isArray(enrichment?.trailers) ? enrichment.trailers : []),
+      trailerYtIds: Array.isArray(meta?.trailerYtIds) && meta.trailerYtIds.length
+        ? meta.trailerYtIds
+        : (Array.isArray(enrichment?.trailerYtIds) ? enrichment.trailerYtIds : [])
+    };
+    const enrichedFallbackSource = resolveTrailerSource(mergedMeta);
+    return enrichedFallbackSource || fallbackSource;
+  } catch (_) {
+    return fallbackSource;
+  }
 }
 
 function getContinueWatchingMetaTimeout(timeoutMs) {
@@ -549,6 +542,7 @@ function normalizeCatalogItem(item, fallbackType = "movie") {
     type: String(item.type || item.apiType || fallbackType || "movie").trim() || "movie",
     apiType: String(item.apiType || item.type || fallbackType || "movie").trim() || "movie",
     name: firstNonEmpty(item.name, item.title, prettyId(item.id)),
+    landscapePoster: firstNonEmpty(item.landscapePoster, item.backdrop, item.backdropUrl, item.background),
     poster: firstNonEmpty(item.poster, item.backdrop, item.backdropUrl, item.thumbnail),
     background: firstNonEmpty(item.background, item.backdrop, item.backdropUrl, item.poster, item.thumbnail),
     logo: firstNonEmpty(item.logo),
@@ -998,7 +992,9 @@ function continueWatchingStreamParams(item, options = {}) {
     playerTitle: normalized.title || normalized.contentId || "Untitled",
     playerEpisodeTitle: isSeries ? (normalized.episodeTitle || "") : "",
     playerReleaseYear: isSeries ? "" : (String(normalized.releaseInfo || "").match(/\b(19|20)\d{2}\b/)?.[0] || ""),
-    videoId: normalized.videoId || normalized.contentId,
+    // Do not turn contentId into a synthetic videoId; the player and sync layer should keep
+    // progress identity stable across entry points.
+    videoId: normalized.videoId || null,
     season: isSeries ? normalized.season : null,
     episode: isSeries ? normalized.episode : null,
     episodeTitle: isSeries ? (normalized.episodeTitle || "") : "",
@@ -1006,8 +1002,7 @@ function continueWatchingStreamParams(item, options = {}) {
     landscapePoster: firstNonEmpty(normalized.landscapePoster, normalized.backdrop, normalized.background, normalized.poster),
     poster: firstNonEmpty(normalized.poster, normalized.backdrop, normalized.background),
     logo: firstNonEmpty(normalized.logo),
-    resumePositionMs: options.startOver ? 0 : (Number(normalized.positionMs || 0) || 0),
-    continueWatchingBackHome: true
+    resumePositionMs: options.startOver ? 0 : (Number(normalized.positionMs || 0) || 0)
   };
 }
 
@@ -1137,15 +1132,36 @@ function groupNodesByOffsetTop(nodes = []) {
   return grouped.map((entry) => entry.nodes);
 }
 
-function createPosterCardMarkup(item, rowIndex, itemIndex, itemType, showLabels = true, layoutMode = "classic", isExpanded = false) {
+function createPosterCardMarkup(item, rowIndex, itemIndex, itemType, showLabels = true, layoutMode = "classic", isExpanded = false, preferLandscapePoster = false) {
   const isLoading = Boolean(item?.isLoading);
   const normalized = normalizeCatalogItem(item, itemType);
   const subtitle = buildPosterSubtitle(normalized, layoutMode);
   const expandedMeta = buildExpandedPosterMeta(normalized);
-  const backdropSrc = firstNonEmpty(normalized.background, normalized.backdrop, normalized.backdropUrl, normalized.poster);
-  const posterSrc = firstNonEmpty(normalized.poster, normalized.thumbnail, normalized.backdrop, normalized.backdropUrl);
+  const preferredLandscapePosterSrc = firstNonEmpty(normalized.landscapePoster);
+  const useLandscapePoster = layoutMode === "modern" && preferLandscapePoster;
+  const landscapeVisualSrc = firstNonEmpty(
+    preferredLandscapePosterSrc,
+    normalized.background,
+    normalized.backdrop,
+    normalized.backdropUrl,
+    normalized.poster,
+    normalized.thumbnail
+  );
+  const backdropSrc = useLandscapePoster
+    ? landscapeVisualSrc
+    : firstNonEmpty(
+      preferredLandscapePosterSrc,
+      normalized.background,
+      normalized.backdrop,
+      normalized.backdropUrl,
+      normalized.poster
+    );
+  const posterSrc = useLandscapePoster
+    ? landscapeVisualSrc
+    : firstNonEmpty(normalized.poster, normalized.thumbnail, preferredLandscapePosterSrc, normalized.backdrop, normalized.backdropUrl);
   const expandedVisualSrc = firstNonEmpty(backdropSrc, posterSrc);
   const expandedClass = isExpanded ? " is-expanded" : "";
+  const landscapeClass = useLandscapePoster ? " is-landscape" : "";
   const focusableClass = isLoading ? "" : " focusable";
   const loadingClass = isLoading ? " home-poster-card-loading" : "";
   const shouldShowLabels = showLabels && !isLoading;
@@ -1155,7 +1171,7 @@ function createPosterCardMarkup(item, rowIndex, itemIndex, itemType, showLabels 
   const titleWidth = titleWidths[safeIndex % titleWidths.length];
   const subtitleWidth = subtitleWidths[safeIndex % subtitleWidths.length];
   return `
-    <article class="home-content-card home-poster-card${focusableClass}${expandedClass}${loadingClass}"
+    <article class="home-content-card home-poster-card${focusableClass}${expandedClass}${landscapeClass}${loadingClass}"
              ${isLoading ? 'aria-disabled="true"' : `data-action="openDetail"
              data-row-index="${rowIndex}"
              data-item-index="${itemIndex}"
@@ -1179,6 +1195,14 @@ function createPosterCardMarkup(item, rowIndex, itemIndex, itemType, showLabels 
       ? `<img class="home-poster-expanded-logo" data-src="${escapeAttribute(normalized.logo)}" decoding="async" loading="lazy" alt="${escapeAttribute(normalized.name || "content")}" />`
       : `<div class="home-poster-expanded-title">${escapeHtml(normalized.name || "Untitled")}</div>`}
         </div>
+        ${(!isLoading && useLandscapePoster) ? `
+          <div class="home-poster-landscape-copy" aria-hidden="true">
+            ${normalized.logo
+      ? `<img class="home-poster-landscape-logo" src="${escapeAttribute(normalized.logo)}" decoding="async" loading="lazy" alt="" />`
+      : `<div class="home-poster-landscape-title">${escapeHtml(normalized.name || "Untitled")}</div>`}
+            ${subtitle ? `<div class="home-poster-landscape-subtitle">${escapeHtml(subtitle)}</div>` : ""}
+          </div>
+        ` : ""}
       </div>
       <div class="home-poster-expanded-copy">
         ${(!isLoading && expandedMeta) ? `<div class="home-poster-expanded-meta">${escapeHtml(expandedMeta)}</div>` : ""}
@@ -1495,6 +1519,29 @@ export const HomeScreen = {
     return baseline + 40;
   },
 
+  cancelScheduledRender() {
+    if (this.homeRenderFrame) {
+      cancelAnimationFrame(this.homeRenderFrame);
+      this.homeRenderFrame = null;
+    }
+  },
+
+  requestRender() {
+    if (!this.container || Router.getCurrent() !== "home") {
+      return;
+    }
+    if (this.homeRenderFrame) {
+      return;
+    }
+    this.homeRenderFrame = requestAnimationFrame(() => {
+      this.homeRenderFrame = null;
+      if (!this.container || Router.getCurrent() !== "home") {
+        return;
+      }
+      this.render();
+    });
+  },
+
   stopHeroRotation() {
     if (this.heroRotateTimer) {
       clearInterval(this.heroRotateTimer);
@@ -1515,7 +1562,7 @@ export const HomeScreen = {
 
   startHeroRotation() {
     this.stopHeroRotation();
-    if (this.layoutMode === "modern") {
+    if (this.layoutMode === "modern" || this.isPerformanceConstrained()) {
       return;
     }
     if (!Array.isArray(this.heroCandidates) || this.heroCandidates.length <= 1) {
@@ -1702,7 +1749,10 @@ export const HomeScreen = {
     return rowNodes[Math.max(0, Math.min(rowNodes.length - 1, preferredIndex))] || rowNodes[0];
   },
 
-  focusWithoutAutoScroll(target) {
+  focusWithoutAutoScroll(target, { suppressDelegatedFocus = false } = {}) {
+    if (suppressDelegatedFocus && target) {
+      this.pendingDelegatedFocusTarget = target;
+    }
     focusWithoutAutoScroll(target);
   },
 
@@ -1807,6 +1857,11 @@ export const HomeScreen = {
     if (!buttons.length) {
       return false;
     }
+    this.container?.querySelectorAll(".focusable.focused").forEach((node) => {
+      if (!node.classList.contains("hold-menu-button")) {
+        node.classList.remove("focused");
+      }
+    });
     const currentIndex = Math.max(0, Math.min(buttons.length - 1, Number(this.continueWatchingMenu?.optionIndex || 0)));
     buttons.forEach((node, index) => node.classList.toggle("focused", index === currentIndex));
     const target = buttons[currentIndex] || buttons[0] || null;
@@ -1869,6 +1924,76 @@ export const HomeScreen = {
     this.pendingContinueWatchingEnterTarget = null;
   },
 
+  isContinueWatchingHoldTarget(node) {
+    return Boolean(node?.matches?.(".home-continue-card.focusable"));
+  },
+
+  cancelPendingContinueWatchingHold() {
+    if (this.pendingContinueWatchingHoldTimer) {
+      clearTimeout(this.pendingContinueWatchingHoldTimer);
+      this.pendingContinueWatchingHoldTimer = null;
+    }
+    this.pendingContinueWatchingHoldTarget = null;
+  },
+
+  hasPendingContinueWatchingHold(node) {
+    const pending = this.pendingContinueWatchingHoldTarget;
+    if (!pending || !node) {
+      return false;
+    }
+    return String(node.dataset.itemId || "") === String(pending.itemId || "")
+      && String(node.dataset.videoId || "") === String(pending.videoId || "");
+  },
+
+  startPendingContinueWatchingHold(node) {
+    const item = this.getContinueWatchingItemFromNode(node);
+    if (!item?.contentId) {
+      return false;
+    }
+    this.cancelPendingContinueWatchingEnter();
+    this.cancelPendingContinueWatchingHold();
+    this.pendingContinueWatchingHoldTarget = {
+      itemId: String(item.contentId || ""),
+      videoId: String(item.videoId || ""),
+      holdTriggered: false
+    };
+    this.pendingContinueWatchingHoldTimer = setTimeout(() => {
+      this.pendingContinueWatchingHoldTimer = null;
+      const pending = this.pendingContinueWatchingHoldTarget;
+      if (!pending || Router.getCurrent() !== "home") {
+        return;
+      }
+      const current = this.container?.querySelector(".home-continue-card.focusable.focused") || null;
+      if (!this.hasPendingContinueWatchingHold(current)) {
+        return;
+      }
+      pending.holdTriggered = true;
+      this.openContinueWatchingMenu(current);
+    }, CW_HOLD_DELAY_MS);
+    return true;
+  },
+
+  completePendingContinueWatchingHold(node) {
+    const pending = this.pendingContinueWatchingHoldTarget;
+    if (!pending) {
+      return false;
+    }
+    const holdTriggered = Boolean(pending.holdTriggered);
+    this.cancelPendingContinueWatchingHold();
+    if (holdTriggered) {
+      return true;
+    }
+    if (!this.isContinueWatchingHoldTarget(node)) {
+      return false;
+    }
+    const item = this.getContinueWatchingItemFromNode(node);
+    if (!item?.contentId) {
+      return false;
+    }
+    this.openContinueWatchingFromItem(item);
+    return true;
+  },
+
   scheduleContinueWatchingEnter(node) {
     const item = this.getContinueWatchingItemFromNode(node);
     if (!item?.contentId) {
@@ -1909,22 +2034,17 @@ export const HomeScreen = {
     this.cancelPendingContinueWatchingEnter();
     this.continueWatchingMenu = null;
 
-    if (isSeriesTypeForContinueWatching(normalized?.type)) {
-      Router.navigate("detail", {
-        itemId: normalized.contentId,
-        itemType: normalized.type || "series",
-        fallbackTitle: normalized.title || normalized.contentId || "Untitled",
-        autoOpenContinueWatching: true,
-        resumeProgressMs: Number(params.resumePositionMs || 0) || 0,
-        resumeVideoId: normalized.videoId || null,
-        resumeSeason: normalized.season ?? null,
-        resumeEpisode: normalized.episode ?? null,
-        continueWatchingBackHome: true
-      });
-      return true;
-    }
-
-    Router.navigate("stream", params);
+    Router.navigate("detail", {
+      itemId: normalized.contentId,
+      itemType: normalized.type || (isSeriesTypeForContinueWatching(normalized?.type) ? "series" : "movie"),
+      fallbackTitle: normalized.title || normalized.contentId || "Untitled",
+      autoOpenContinueWatching: true,
+      returnHomeOnBack: true,
+      resumeProgressMs: Number(params.resumePositionMs || 0) || 0,
+      resumeVideoId: normalized.videoId || null,
+      resumeSeason: normalized.season ?? null,
+      resumeEpisode: normalized.episode ?? null
+    });
     return true;
   },
 
@@ -2132,6 +2252,17 @@ export const HomeScreen = {
     if (!container) {
       return;
     }
+    const activeFrame = container.querySelector("iframe");
+    if (activeFrame) {
+      try {
+        activeFrame.src = "about:blank";
+      } catch (_) {
+      }
+      try {
+        activeFrame.removeAttribute("src");
+      } catch (_) {
+      }
+    }
     const activeVideo = container.querySelector("video");
     if (activeVideo) {
       try {
@@ -2233,33 +2364,43 @@ export const HomeScreen = {
     if (!itemId) {
       return null;
     }
-    const cache = this.trailerPreviewCache || (this.trailerPreviewCache = new Map());
-    const cacheKey = `${itemType}:${itemId}`;
-    if (cache.has(cacheKey)) {
-      return cache.get(cacheKey) || null;
-    }
     try {
+      const inlineSource = await withTimeout(
+        resolveTrailerMetaWithTmdbFallback(
+          { ...(item || {}), id: itemId, type: itemType },
+          itemType
+        ),
+        2200,
+        null
+      );
+      if (inlineSource) {
+        return inlineSource;
+      }
+
       const result = await withTimeout(
         metaRepository.getMetaFromAllAddons(itemType, itemId),
-        2200,
+        3200,
         { status: "error", message: "timeout" }
       );
-      const source = result?.status === "success" ? resolveTrailerSource(result?.data || {}) : null;
-      cache.set(cacheKey, source || null);
+      const source = result?.status === "success"
+        ? await resolveTrailerMetaWithTmdbFallback(
+          { ...(result?.data || {}), id: itemId, type: itemType },
+          itemType
+        )
+        : null;
       return source || null;
     } catch (error) {
       console.warn("Home trailer preview lookup failed", error);
-      cache.set(cacheKey, null);
       return null;
     }
   },
 
-  async activateFocusedPosterFlow(node) {
+  async activateFocusedPosterFlow(node, flowToken = Number(this.focusedPosterFlowToken || 0)) {
     if (!this.isModernPosterNode(node) || !node.classList.contains("focused")) {
       return;
     }
     const prefs = this.layoutPrefs || {};
-    const shouldExpand = Boolean(prefs.focusedPosterBackdropExpandEnabled);
+    const shouldExpand = Boolean(prefs.focusedPosterBackdropExpandEnabled || prefs.modernLandscapePostersEnabled);
     const shouldPreviewTrailer = Boolean(prefs.focusedPosterBackdropTrailerEnabled);
     const trailerTarget = String(prefs.focusedPosterBackdropTrailerPlaybackTarget || "hero_media").toLowerCase();
     if (shouldExpand) {
@@ -2271,6 +2412,9 @@ export const HomeScreen = {
 
     const sourceItem = this.getNodeHeroSource(node);
     const baseSource = await this.getTrailerSourceForItem(sourceItem);
+    if (Number(this.focusedPosterFlowToken || 0) !== Number(flowToken || 0)) {
+      return;
+    }
     const source = applyTrailerAudioPreferences(baseSource, prefs);
     if (!source || !node.classList.contains("focused")) {
       return;
@@ -2280,7 +2424,7 @@ export const HomeScreen = {
       const trailerLayer = node.querySelector(".home-poster-trailer-layer");
       if (trailerLayer) {
         this.mountTrailerLayer(trailerLayer, source, () => {
-          if (node.classList.contains("focused")) {
+          if (node.classList.contains("focused") && Number(this.focusedPosterFlowToken || 0) === Number(flowToken || 0)) {
             node.classList.add("is-trailer-active");
           }
         });
@@ -2292,7 +2436,7 @@ export const HomeScreen = {
     const heroMedia = this.container?.querySelector(".home-modern-hero-media");
     if (heroLayer && heroMedia) {
       this.mountTrailerLayer(heroLayer, source, () => {
-        if (node.classList.contains("focused")) {
+        if (node.classList.contains("focused") && Number(this.focusedPosterFlowToken || 0) === Number(flowToken || 0)) {
           heroMedia.classList.add("trailer-active");
         }
       });
@@ -2304,10 +2448,41 @@ export const HomeScreen = {
       clearTimeout(this.focusedPosterTimer);
       this.focusedPosterTimer = null;
     }
+    this.focusedPosterFlowToken = Number(this.focusedPosterFlowToken || 0) + 1;
+  },
+
+  clearFocusedPosterFlowState() {
+    this.focusedPosterFlowState = null;
+  },
+
+  getFocusedPosterFlowKey(node) {
+    const itemId = String(
+      node?.dataset?.itemId
+      || node?.dataset?.contentId
+      || this.getNodeHeroSource(node)?.id
+      || ""
+    ).trim();
+    const itemType = String(
+      node?.dataset?.itemType
+      || this.getNodeHeroSource(node)?.type
+      || ""
+    ).trim().toLowerCase();
+    if (!itemId) {
+      return "";
+    }
+    return `${itemType}:${itemId}`;
   },
 
   scheduleHomeTruncationUpdate({ scope = null } = {}) {
     if (!this.container) {
+      return;
+    }
+    if (this.isPerformanceConstrained()) {
+      this.homeTruncationScope = null;
+      if (this.homeTruncationFrame) {
+        cancelAnimationFrame(this.homeTruncationFrame);
+        this.homeTruncationFrame = null;
+      }
       return;
     }
     this.homeTruncationScope = scope || null;
@@ -2321,7 +2496,7 @@ export const HomeScreen = {
   },
 
   applyHomeTruncationState() {
-    if (!this.container) {
+    if (!this.container || this.isPerformanceConstrained()) {
       return;
     }
     const root = this.homeTruncationScope || this.container;
@@ -2370,7 +2545,7 @@ export const HomeScreen = {
   },
 
   ensureHomeTruncationObservers() {
-    if (this.homeTruncationObserversBound) {
+    if (this.homeTruncationObserversBound || this.isPerformanceConstrained()) {
       return;
     }
     this.homeTruncationObserversBound = true;
@@ -2392,22 +2567,50 @@ export const HomeScreen = {
     }
     this.cancelFocusedPosterFlow();
     const prefs = this.layoutPrefs || {};
-    const shouldExpand = Boolean(prefs.focusedPosterBackdropExpandEnabled);
+    const shouldExpand = Boolean(prefs.focusedPosterBackdropExpandEnabled || prefs.modernLandscapePostersEnabled);
     const shouldRun = Boolean(shouldExpand || prefs.focusedPosterBackdropTrailerEnabled);
     if (!shouldRun) {
+      this.clearFocusedPosterFlowState();
       this.collapseFocusedPoster();
       return;
     }
     if (!this.isModernPosterNode(node)) {
+      this.clearFocusedPosterFlowState();
       this.collapseFocusedPoster();
       return;
     }
     if (this.expandedPosterNode && this.expandedPosterNode !== node) {
       this.collapseFocusedPoster(this.expandedPosterNode);
     }
-    const delayMs = Math.max(0, Number(prefs.focusedPosterBackdropExpandDelaySeconds ?? 3)) * 1000;
+    const flowKey = this.getFocusedPosterFlowKey(node);
+    if (this.focusedPosterFlowState?.key && this.focusedPosterFlowState.key !== flowKey) {
+      this.collapseFocusedPoster();
+    }
+    const defaultDelayMs = Math.max(0, Number(prefs.focusedPosterBackdropExpandDelaySeconds ?? 3)) * 1000;
+    const existingState = this.focusedPosterFlowState;
+    const canReuseExistingState = Boolean(flowKey && existingState?.key === flowKey);
+    const now = Date.now();
+    const delayMs = canReuseExistingState
+      ? Math.max(0, Number(existingState.activated ? 0 : ((existingState.activateAt || now) - now)))
+      : defaultDelayMs;
+    const flowToken = Number(this.focusedPosterFlowToken || 0) + 1;
+    this.focusedPosterFlowToken = flowToken;
+    this.focusedPosterFlowState = {
+      key: flowKey,
+      activateAt: now + delayMs,
+      activated: Boolean(canReuseExistingState && existingState.activated),
+      token: flowToken
+    };
     this.focusedPosterTimer = setTimeout(() => {
-      this.activateFocusedPosterFlow(node).catch((error) => {
+      if (this.focusedPosterFlowState?.key === flowKey && this.focusedPosterFlowState?.token === flowToken) {
+        this.focusedPosterFlowState = {
+          key: flowKey,
+          activateAt: Date.now(),
+          activated: true,
+          token: flowToken
+        };
+      }
+      this.activateFocusedPosterFlow(node, flowToken).catch((error) => {
         console.warn("Focused poster flow failed", error);
       });
     }, delayMs);
@@ -2418,6 +2621,7 @@ export const HomeScreen = {
       return;
     }
     this.cancelFocusedPosterFlow();
+    this.clearFocusedPosterFlowState();
     if (this.isModernPosterNode(node)) {
       this.collapseFocusedPoster(node);
       this.scheduleFocusedPosterFlow(node);
@@ -2468,15 +2672,23 @@ export const HomeScreen = {
     return this.focusNode(current, target, "right") || true;
   },
 
-  ensureMainVerticalVisibility(target) {
+  getMainFocusAnchor(node) {
+    if (!node) {
+      return null;
+    }
+    return node.closest(".home-row, .home-grid-section")
+      || node.closest(".home-hero")
+      || node;
+  },
+
+  ensureMainVerticalVisibility(target, direction = null, current = null) {
     const main = this.layoutMode === "modern"
       ? this.container?.querySelector(".home-modern-rows-viewport")
       : this.container?.querySelector(".home-main");
     if (!main || !target || !this.container?.contains(target)) {
       return;
     }
-    const row = target.closest(".home-row, .home-grid-section");
-    const anchor = row || target.closest(".home-hero") || target;
+    const anchor = this.getMainFocusAnchor(target);
     const mainRect = main.getBoundingClientRect();
     const anchorRect = anchor.getBoundingClientRect();
     const inset = this.getRowFocusInset();
@@ -2486,7 +2698,17 @@ export const HomeScreen = {
     const anchorBottom = anchorRect.bottom - mainRect.top + main.scrollTop;
 
     if (this.layoutMode === "modern") {
+      const currentAnchor = this.getMainFocusAnchor(current);
+      const sameAnchor = Boolean(currentAnchor && currentAnchor === anchor);
+      const isHorizontalMove = direction === "left" || direction === "right";
+      const anchorFullyVisible = anchorRect.top >= visibleTop && anchorRect.bottom <= visibleBottom;
+      if (isHorizontalMove && sameAnchor && anchorFullyVisible) {
+        return;
+      }
       const centeredScrollTop = anchorTop - Math.max(0, (main.clientHeight - anchor.offsetHeight) / 2);
+      if (Math.abs(Number(main.scrollTop || 0) - centeredScrollTop) <= 1) {
+        return;
+      }
       this.animateScroll(main, "y", centeredScrollTop, this.getScrollDuration(150));
       return;
     }
@@ -2531,20 +2753,6 @@ export const HomeScreen = {
       }
     }
 
-    if (this.layoutMode === "modern") {
-      const trackRect = track.getBoundingClientRect();
-      const targetRect = target.getBoundingClientRect();
-      const targetLeft = (targetRect.left - trackRect.left) + Number(track.scrollLeft || 0);
-      const maxScrollLeft = Math.max(0, Number(track.scrollWidth || 0) - Number(track.clientWidth || 0));
-      this.animateScroll(
-        track,
-        "x",
-        Math.max(0, Math.min(maxScrollLeft, targetLeft - leftPadding)),
-        140
-      );
-      return;
-    }
-
     const safeRightPadding = Math.min(rightPadding, Math.max(24, leftPadding));
     const targetLeft = target.offsetLeft;
     const targetRight = targetLeft + target.offsetWidth;
@@ -2572,18 +2780,19 @@ export const HomeScreen = {
     }
     current.classList.remove("focused");
     target.classList.add("focused");
-    this.focusWithoutAutoScroll(target);
+    this.focusWithoutAutoScroll(target, { suppressDelegatedFocus: true });
     this.setSidebarExpanded(this.isSidebarNode(target));
     if (this.isMainNode(target)) {
       this.lastMainFocus = target;
       this.rememberMainRowFocus(target);
       this.ensureTrackHorizontalVisibility(target, direction);
-      this.ensureMainVerticalVisibility(target);
+      this.ensureMainVerticalVisibility(target, direction, current);
       this.scheduleModernHeroUpdate(target);
       this.scheduleFocusedPosterFlow(target);
     } else {
       this.cancelPendingHeroFocus();
       this.cancelFocusedPosterFlow();
+      this.clearFocusedPosterFlowState();
       this.collapseFocusedPoster();
     }
     return true;
@@ -2741,16 +2950,6 @@ export const HomeScreen = {
       if (!targetRowNodes || !targetRowNodes.length) {
         return true;
       }
-      const currentRowKey = this.getNodeRowKey(current);
-      const targetRowKey = this.getNodeRowKey(targetRowNodes[0]);
-      if (
-        direction === "down"
-        && this.continueWatchingLoading
-        && currentRowKey === "continue_watching"
-        && targetRowKey !== "continue_watching"
-      ) {
-        return true;
-      }
       const target = this.resolvePreferredNodeForRow(targetRowNodes, col);
       return this.focusNode(current, target, direction) || true;
     }
@@ -2767,6 +2966,13 @@ export const HomeScreen = {
         const target = event?.target?.closest?.(".focusable");
         if (!target || !this.container?.contains(target)) {
           return;
+        }
+        if (this.pendingDelegatedFocusTarget) {
+          const isSuppressedProgrammaticFocus = this.pendingDelegatedFocusTarget === target;
+          this.pendingDelegatedFocusTarget = null;
+          if (isSuppressedProgrammaticFocus) {
+            return;
+          }
         }
         if (target.closest(".home-sidebar .focusable, .modern-sidebar-panel .focusable")) {
           this.setSidebarExpanded(true);
@@ -2827,6 +3033,8 @@ export const HomeScreen = {
     this.container = document.getElementById("home");
     ScreenUtils.show(this.container);
     this.ensureDelegatedEventsBound();
+    this.sidebarExpanded = false;
+    this.pillIconOnly = false;
     this.homeRouteEnterPending = true;
     this.continueWatchingMenu = null;
     this.pendingContinueWatchingFocusIndex = null;
@@ -2951,7 +3159,7 @@ export const HomeScreen = {
       }
       if (profile) {
         this.sidebarProfile = profile;
-        this.render();
+        this.requestRender();
       }
     });
 
@@ -2969,7 +3177,7 @@ export const HomeScreen = {
         if (!this.heroItem) {
           this.heroItem = this.pickInitialHero();
         }
-        this.render();
+        this.requestRender();
         this.retryPendingCatalogRows();
       }).catch((error) => {
         console.warn("Deferred home rows load failed", error);
@@ -3006,7 +3214,7 @@ export const HomeScreen = {
       if (!suppressContinueWatchingLoading) {
         this.continueWatchingLoading = shouldShowLoading;
         this.continueWatchingDisplay = [];
-        this.render();
+        this.requestRender();
       }
 
       if (!shouldShowLoading) {
@@ -3023,7 +3231,7 @@ export const HomeScreen = {
         }
         this.continueWatchingLoading = false;
         this.continueWatchingDisplay = [];
-        this.render();
+        this.requestRender();
         return;
       }
 
@@ -3055,12 +3263,12 @@ export const HomeScreen = {
             this.forceInitialContinueWatchingFocus = true;
           }
         }
-        this.render();
+        this.requestRender();
       } catch (error) {
         console.warn("Continue watching async enrichment failed", error);
         this.continueWatchingLoading = false;
         if (!suppressContinueWatchingLoading) {
-          this.render();
+          this.requestRender();
         }
       }
     })().catch((error) => {
@@ -3070,7 +3278,7 @@ export const HomeScreen = {
       }
       this.continueWatchingLoading = false;
       if (!suppressContinueWatchingLoading) {
-        this.render();
+        this.requestRender();
       }
     });
 
@@ -3180,7 +3388,7 @@ export const HomeScreen = {
         if (!this.heroItem) {
           this.heroItem = this.pickInitialHero();
         }
-        this.render();
+        this.requestRender();
       } catch (error) {
         console.warn("Retry catalog row load failed", error);
       }
@@ -3193,6 +3401,7 @@ export const HomeScreen = {
   },
 
   render() {
+    this.cancelScheduledRender();
     const retainedFocusState = this.captureCurrentFocusState() || this.savedFocusStates?.[this.layoutMode] || null;
     this.cancelFocusedPosterFlow();
     this.expandedPosterNode = null;
@@ -3208,11 +3417,13 @@ export const HomeScreen = {
     const showPosterLabels = this.layoutPrefs?.posterLabelsEnabled !== false;
     const showCatalogAddonName = this.layoutPrefs?.catalogAddonNameEnabled !== false;
     const showCatalogTypeSuffix = this.layoutPrefs?.catalogTypeSuffixEnabled !== false;
+    const modernLandscapePostersEnabled = this.layoutMode === "modern"
+      && Boolean(this.layoutPrefs?.modernLandscapePostersEnabled);
     const focusState = retainedFocusState && retainedFocusState.focusKind === "item"
       ? retainedFocusState
       : null;
     const expandFocusedPoster = this.layoutMode === "modern"
-      && Boolean(this.layoutPrefs?.focusedPosterBackdropExpandEnabled)
+      && Boolean(this.layoutPrefs?.focusedPosterBackdropExpandEnabled || modernLandscapePostersEnabled)
       && Number(this.layoutPrefs?.focusedPosterBackdropExpandDelaySeconds ?? 3) <= 0
       && Boolean(focusState);
     const rowItemLimit = this.getRowItemLimit();
@@ -3244,6 +3455,7 @@ export const HomeScreen = {
         showHeroSection,
         showPosterLabels,
         showCatalogTypeSuffix,
+        preferLandscapePosters: modernLandscapePostersEnabled,
         focusedRowKey: focusState?.rowKey || "",
         focusedItemIndex: Number.isFinite(focusState?.itemIndex) ? focusState.itemIndex : -1,
         expandFocusedPoster,
@@ -3282,9 +3494,8 @@ export const HomeScreen = {
       `;
     }
 
-    const modernSidebarClass = this.layoutPrefs?.modernSidebar ? " modern-sidebar-enabled" : "";
     this.container.innerHTML = `
-      <div class="home-shell home-screen-shell ${layoutClass}${modernSidebarClass}">
+      <div class="home-shell home-screen-shell ${layoutClass}">
         ${renderRootSidebar({
       selectedRoute: "home",
       profile: this.sidebarProfile,
@@ -3313,7 +3524,7 @@ export const HomeScreen = {
     const canAttemptRestore = Boolean(retainedFocusState);
     let restoredFocus = false;
     if (this.continueWatchingMenu) {
-      this.applyContinueWatchingMenuFocus();
+      restoredFocus = this.applyContinueWatchingMenuFocus();
     } else if (Number.isFinite(this.pendingContinueWatchingFocusIndex)) {
       const cards = Array.from(this.container?.querySelectorAll(".home-row-continue .home-content-card.focusable") || []);
       const target = cards[Math.max(0, Math.min(cards.length - 1, Number(this.pendingContinueWatchingFocusIndex || 0)))]
@@ -3321,6 +3532,7 @@ export const HomeScreen = {
         || null;
       this.pendingContinueWatchingFocusIndex = null;
       if (target) {
+        restoredFocus = true;
         this.container.querySelectorAll(".focusable.focused").forEach((node) => node.classList.remove("focused"));
         target.classList.add("focused");
         this.focusWithoutAutoScroll(target);
@@ -3359,6 +3571,9 @@ export const HomeScreen = {
         this.scheduleFocusedPosterFlow(current);
       }
       this.isRestoringFocusFromBack = false;
+    }
+    if (!this.container?.querySelector(".home-poster-card.focused")) {
+      this.clearFocusedPosterFlowState();
     }
     if (!this.layoutPrefs?.modernSidebar) {
       this.setSidebarExpanded(false);
@@ -3855,8 +4070,10 @@ export const HomeScreen = {
     const currentFocusedNode = this.container?.querySelector(".focusable.focused") || null;
     const code = Number(event?.keyCode || 0);
     const originalKeyCode = Number(event?.originalKeyCode || code || 0);
-    if (code !== 13 || !currentFocusedNode?.matches?.(".home-continue-card.focusable")) {
+    const isTizenHoldTarget = Platform.isTizen() && this.isContinueWatchingHoldTarget(currentFocusedNode);
+    if (!isTizenHoldTarget || code !== 13) {
       this.cancelPendingContinueWatchingEnter();
+      this.cancelPendingContinueWatchingHold();
     }
     if (this.continueWatchingMenu) {
       if (Platform.isBackEvent(event)) {
@@ -3908,12 +4125,21 @@ export const HomeScreen = {
     if (this.handleHomeDpad(event)) {
       return;
     }
-    const wantsContinueWatchingMenu = currentFocusedNode?.matches?.(".home-continue-card.focusable")
+    const isContinueWatchingHoldTarget = this.isContinueWatchingHoldTarget(currentFocusedNode);
+    const wantsContinueWatchingMenu = isContinueWatchingHoldTarget
       && ((code === 13 && event?.repeat) || originalKeyCode === 82 || code === 93);
     if (wantsContinueWatchingMenu) {
       event.preventDefault?.();
       this.cancelPendingContinueWatchingEnter();
+      this.cancelPendingContinueWatchingHold();
       this.openContinueWatchingMenu(currentFocusedNode);
+      return;
+    }
+    if (Platform.isTizen() && code === 13 && isContinueWatchingHoldTarget) {
+      event.preventDefault?.();
+      if (!event?.repeat && !this.hasPendingContinueWatchingHold(currentFocusedNode)) {
+        this.startPendingContinueWatchingHold(currentFocusedNode);
+      }
       return;
     }
     if (code === 76) {
@@ -3946,6 +4172,19 @@ export const HomeScreen = {
     }
   },
 
+  onKeyUp(event) {
+    if (!Platform.isTizen()) {
+      return;
+    }
+    if (Number(event?.keyCode || 0) !== 13) {
+      return;
+    }
+    const current = this.container?.querySelector(".home-continue-card.focusable.focused") || null;
+    if (this.completePendingContinueWatchingHold(current)) {
+      event.preventDefault?.();
+    }
+  },
+
   consumeBackRequest() {
     if (this.continueWatchingMenu) {
       this.closeContinueWatchingMenu();
@@ -3956,14 +4195,22 @@ export const HomeScreen = {
 
   cleanup() {
     this.cancelPendingContinueWatchingEnter();
+    this.cancelPendingContinueWatchingHold();
     this.continueWatchingMenu = null;
     this.persistCurrentFocusState();
     this.homeLoadToken = (this.homeLoadToken || 0) + 1;
+    this.cancelScheduledRender();
     this.stopHeroRotation();
     this.cancelPendingHeroFocus();
     this.cancelFocusedPosterFlow();
+    this.clearFocusedPosterFlowState();
     this.collapseFocusedPoster();
     this.teardownGridStickyHeader();
+    if (this.homeTruncationFrame) {
+      cancelAnimationFrame(this.homeTruncationFrame);
+      this.homeTruncationFrame = null;
+    }
+    this.homeTruncationScope = null;
     ScreenUtils.hide(this.container);
   }
 };

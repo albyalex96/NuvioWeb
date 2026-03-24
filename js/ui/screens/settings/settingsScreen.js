@@ -38,7 +38,7 @@ import {
 const ROTATED_DPAD_KEY = "rotatedDpadMapping";
 const STRICT_DPAD_GRID_KEY = "strictDpadGridNavigation";
 const SETTINGS_UI_STATE_KEY = "settingsScreenUiState";
-const SETTINGS_VERSION_LABEL = "0.1.1-web";
+const SETTINGS_VERSION_LABEL = "0.1.2";
 const PRIVACY_URL = "https://tapframe.github.io/NuvioStreaming/#privacy-policy";
 const SUPPORTERS_URL = "https://github.com/Tapframe/NuvioStreaming";
 
@@ -226,12 +226,11 @@ function renderLayoutPreviewMarkup(layoutId) {
   const normalized = String(layoutId || "classic").toLowerCase();
   if (normalized === "modern") {
     return `
-      <span class="settings-layout-preview-modern-hero"></span>
-      <span class="settings-layout-preview-modern-row">
-        <span class="settings-layout-preview-modern-card is-strong"></span>
-        <span class="settings-layout-preview-modern-card"></span>
-        <span class="settings-layout-preview-modern-card"></span>
-        <span class="settings-layout-preview-modern-card is-strong"></span>
+      <span class="settings-layout-preview-modern-stage">
+        <span class="settings-layout-preview-modern-hero"></span>
+        <span class="settings-layout-preview-modern-row">
+          ${Array.from({ length: 9 }, (_, index) => `<span class="settings-layout-preview-modern-card${index % 3 === 1 ? " is-strong" : ""}"></span>`).join("")}
+        </span>
       </span>
     `;
   }
@@ -239,34 +238,24 @@ function renderLayoutPreviewMarkup(layoutId) {
   if (normalized === "grid") {
     return `
       <span class="settings-layout-preview-grid-canvas">
-        ${Array.from({ length: 20 }, (_, index) => `
-          <span class="settings-layout-preview-grid-cell${index % 3 === 2 ? " is-dim" : ""}"></span>
+        ${Array.from({ length: 35 }, (_, index) => `
+          <span class="settings-layout-preview-grid-cell${Math.floor(index / 5) % 3 === 2 ? " is-dim" : ""}"></span>
         `).join("")}
       </span>
     `;
   }
 
   return `
-    <span class="settings-layout-preview-classic-row is-top">
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-    </span>
-    <span class="settings-layout-preview-classic-row is-featured">
-      <span class="settings-layout-preview-classic-card is-strong"></span>
-      <span class="settings-layout-preview-classic-card is-strong"></span>
-      <span class="settings-layout-preview-classic-card is-strong"></span>
-      <span class="settings-layout-preview-classic-card is-strong"></span>
-      <span class="settings-layout-preview-classic-card is-strong"></span>
-    </span>
-    <span class="settings-layout-preview-classic-row is-bottom">
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
-      <span class="settings-layout-preview-classic-card"></span>
+    <span class="settings-layout-preview-classic-stage">
+      <span class="settings-layout-preview-classic-row is-top">
+        ${Array.from({ length: 7 }, () => '<span class="settings-layout-preview-classic-card"></span>').join("")}
+      </span>
+      <span class="settings-layout-preview-classic-row is-featured">
+        ${Array.from({ length: 7 }, () => '<span class="settings-layout-preview-classic-card is-strong"></span>').join("")}
+      </span>
+      <span class="settings-layout-preview-classic-row is-bottom">
+        ${Array.from({ length: 7 }, () => '<span class="settings-layout-preview-classic-card"></span>').join("")}
+      </span>
     </span>
   `;
 }
@@ -533,6 +522,50 @@ function scrollSettingsRailItem(node) {
   rail.scrollTop = nextScrollTop;
 }
 
+function isScrollContainerAtBoundary(node, direction) {
+  if (!node) {
+    return true;
+  }
+
+  const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+  if (maxScrollTop <= 0) {
+    return true;
+  }
+
+  const scrollTop = Number(node.scrollTop || 0);
+  if (direction === "up") {
+    return scrollTop <= 1;
+  }
+  if (direction === "down") {
+    return scrollTop >= maxScrollTop - 1;
+  }
+  return false;
+}
+
+function captureSettingsScrollState(contentNode) {
+  if (!contentNode) {
+    return null;
+  }
+
+  const themeGrid = contentNode.querySelector(".settings-theme-grid");
+  return {
+    contentScrollTop: Number(contentNode.scrollTop || 0),
+    themeGridScrollTop: Number(themeGrid?.scrollTop || 0)
+  };
+}
+
+function restoreSettingsScrollState(contentNode, scrollState) {
+  if (!contentNode || !scrollState) {
+    return;
+  }
+
+  contentNode.scrollTop = Number(scrollState.contentScrollTop || 0);
+  const themeGrid = contentNode.querySelector(".settings-theme-grid");
+  if (themeGrid) {
+    themeGrid.scrollTop = Number(scrollState.themeGridScrollTop || 0);
+  }
+}
+
 function addonKindsLabel(addon) {
   const kinds = Array.isArray(addon?.types) ? addon.types.filter(Boolean) : [];
   if (!kinds.length) {
@@ -590,9 +623,14 @@ function readSettingsUiState() {
     activeSection: typeof state?.activeSection === "string" ? state.activeSection : null,
     navIndex: Number.isFinite(state?.navIndex) ? state.navIndex : null,
     contentFocusKey: typeof state?.contentFocusKey === "string" ? state.contentFocusKey : null,
+    appearanceThemeFocusKey: typeof state?.appearanceThemeFocusKey === "string" ? state.appearanceThemeFocusKey : null,
     integrationView: typeof state?.integrationView === "string" ? state.integrationView : "hub",
     expandedSections: normalizeExpandedSections(state?.expandedSections)
   };
+}
+
+function isAppearanceThemeFocusKey(focusKey) {
+  return String(focusKey || "").startsWith("appearance:theme:");
 }
 
 export const SettingsScreen = {
@@ -616,8 +654,11 @@ export const SettingsScreen = {
   async mount() {
     this.container = document.getElementById("settings");
     ScreenUtils.show(this.container);
+    if (!this.handleWheelBound) {
+      this.handleWheelBound = this.handleWheelEvent.bind(this);
+      this.container.addEventListener("wheel", this.handleWheelBound, { passive: false });
+    }
     this.settingsRouteEnterPending = true;
-    this.sidebarProfile = await getSidebarProfileState();
     const persistedUiState = readSettingsUiState();
     this.activeSection = persistedUiState.activeSection || this.activeSection || null;
     this.focusZone = "nav";
@@ -626,6 +667,7 @@ export const SettingsScreen = {
       ? persistedUiState.navIndex
       : (Number.isFinite(this.navIndex) ? this.navIndex : SECTION_META.findIndex((section) => section.id === this.activeSection));
     this.contentFocusKey = persistedUiState.contentFocusKey || this.contentFocusKey || null;
+    this.appearanceThemeFocusKey = persistedUiState.appearanceThemeFocusKey || this.appearanceThemeFocusKey || null;
     this.pluginDraft = this.pluginDraft || "";
     this.integrationView = persistedUiState.integrationView || this.integrationView || "hub";
     this.expandedSections = normalizeExpandedSections(persistedUiState.expandedSections || this.expandedSections);
@@ -633,7 +675,13 @@ export const SettingsScreen = {
     this.dialogFocusIndex = Number.isFinite(this.dialogFocusIndex) ? this.dialogFocusIndex : 0;
     this.sidebarExpanded = false;
     this.pillIconOnly = false;
-    await this.render();
+    const [sidebarProfile, initialModel] = await Promise.all([
+      getSidebarProfileState(),
+      this.collectModel()
+    ]);
+    this.sidebarProfile = sidebarProfile;
+    this.model = initialModel;
+    await this.render({ refreshModel: false });
   },
 
   ensureExpandedState(sectionId) {
@@ -645,9 +693,25 @@ export const SettingsScreen = {
       activeSection: this.activeSection || null,
       navIndex: Number.isFinite(this.navIndex) ? this.navIndex : null,
       contentFocusKey: this.contentFocusKey || null,
+      appearanceThemeFocusKey: this.appearanceThemeFocusKey || null,
       integrationView: this.integrationView || "hub",
       expandedSections: normalizeExpandedSections(this.expandedSections)
     });
+  },
+
+  rememberAppearanceThemeFocusKey(focusKey = this.contentFocusKey) {
+    if (!isAppearanceThemeFocusKey(focusKey)) {
+      return;
+    }
+    if (this.appearanceThemeFocusKey === focusKey) {
+      return;
+    }
+    this.appearanceThemeFocusKey = focusKey;
+    this.persistUiState();
+  },
+
+  getAppearanceThemeFocusKey() {
+    return this.appearanceThemeFocusKey || `appearance:theme:${THEME_OPTIONS[0]?.id || "WHITE"}`;
   },
 
   collapseExpandedSection(sectionId) {
@@ -660,9 +724,13 @@ export const SettingsScreen = {
   setActiveSection(sectionId) {
     const nextSectionId = sectionId || null;
     if (this.activeSection && this.activeSection !== nextSectionId) {
+      this.rememberAppearanceThemeFocusKey();
       this.collapseExpandedSection(this.activeSection);
     }
     this.activeSection = sectionId || null;
+    this.contentFocusKey = this.activeSection === "appearance"
+      ? this.getAppearanceThemeFocusKey()
+      : null;
     this.persistUiState();
   },
 
@@ -678,8 +746,10 @@ export const SettingsScreen = {
   },
 
   async collectModel() {
-    const addons = await addonRepository.getInstalledAddons();
-    const profiles = await ProfileManager.getProfiles();
+    const [addons, profiles] = await Promise.all([
+      addonRepository.getInstalledAddons(),
+      ProfileManager.getProfiles()
+    ]);
     const activeProfileId = ProfileManager.getActiveProfileId();
     const pluginSources = PluginManager.listPluginSources();
 
@@ -713,7 +783,6 @@ export const SettingsScreen = {
           ${renderSectionNavIcon(item.id)}
           <span class="settings-nav-label-wrap">
             <span class="settings-nav-label">${escapeHtml(translateSectionCopy(item).label)}</span>
-            ${item.id === "appearance" ? '<span class="settings-nav-badge">Beta</span>' : ""}
           </span>
         </span>
         ${iconSvg(ROW_ICONS.chevron, "settings-nav-chevron")}
@@ -786,12 +855,13 @@ export const SettingsScreen = {
 
   renderThemeCard(theme, selected, focusKey) {
     const selectedClass = selected ? " is-selected" : "";
+    const swatchClass = theme.id === "WHITE" ? " settings-theme-swatch-light" : "";
     return `
       <button class="settings-theme-card settings-content-focusable focusable${selectedClass}"
               data-zone="content"
               ${this.registerAction(focusKey, this.actionMap.get(focusKey))}>
         <span class="settings-theme-swatch-wrap">
-          <span class="settings-theme-swatch" style="background:${escapeHtml(theme.color)};">
+          <span class="settings-theme-swatch${swatchClass}" style="background:${escapeHtml(theme.color)};">
             ${selected ? iconSvg(ROW_ICONS.check, "settings-theme-check") : ""}
           </span>
         </span>
@@ -806,6 +876,7 @@ export const SettingsScreen = {
       <button class="settings-layout-card settings-content-focusable focusable${selected ? " is-selected" : ""}"
               data-zone="content"
               ${this.registerAction(focusKey, this.actionMap.get(focusKey))}>
+        <span class="settings-layout-badge">${escapeHtml(t("common.beta", {}, "Beta"))}</span>
         <span class="settings-layout-preview settings-layout-preview-${escapeHtml(option.id)}">${renderLayoutPreviewMarkup(option.id)}</span>
         <span class="settings-layout-name">${escapeHtml(translateOptionLabel(option))}</span>
         <span class="settings-layout-caption">${escapeHtml(translateOptionCaption(option))}</span>
@@ -1014,7 +1085,7 @@ export const SettingsScreen = {
   renderAppearanceSection(model) {
     THEME_OPTIONS.forEach((theme) => {
       this.actionMap.set(`appearance:theme:${theme.id}`, () => {
-        ThemeStore.set({ themeName: theme.id });
+        ThemeStore.set({ themeName: theme.id, accentColor: theme.color });
         ThemeManager.apply();
       });
     });
@@ -1705,6 +1776,9 @@ export const SettingsScreen = {
     this.actionMap.set("playback:trailer", () => {
       PlayerSettingsStore.set({ trailerAutoplay: !PlayerSettingsStore.get().trailerAutoplay });
     });
+    this.actionMap.set("playback:skipIntro", () => {
+      PlayerSettingsStore.set({ skipIntroEnabled: !PlayerSettingsStore.get().skipIntroEnabled });
+    });
     this.actionMap.set("playback:audioLanguage", () => {
       this.openOptionDialog({
         title: t("settings.dialogs.preferredAudioLanguage"),
@@ -1763,6 +1837,12 @@ export const SettingsScreen = {
       title: t("settings.playback.autoplayNextEpisode.title"),
       subtitle: t("settings.playback.autoplayNextEpisode.subtitle"),
       checked: Boolean(model.player.autoplayNextEpisode)
+    })}
+        ${this.renderToggleRow({
+      focusKey: "playback:skipIntro",
+      title: t("settings.playback.skipIntro.title", {}, "Skip Intro"),
+      subtitle: t("settings.playback.skipIntro.subtitle", {}, "Use IntroDB to detect intro, recap and outro segments when available."),
+      checked: Boolean(model.player.skipIntroEnabled)
     })}
       </div>
     `;
@@ -1919,8 +1999,10 @@ export const SettingsScreen = {
     return this.renderAboutSection(model);
   },
 
-  async render() {
-    this.model = await this.collectModel();
+  async render({ refreshModel = true } = {}) {
+    if (refreshModel || !this.model) {
+      this.model = await this.collectModel();
+    }
     this.layoutPrefs = this.model.layout;
     this.sidebarExpanded = Boolean(this.layoutPrefs?.modernSidebar && this.sidebarExpanded);
     this.visibleSections = getVisibleSections(this.model);
@@ -1972,9 +2054,13 @@ export const SettingsScreen = {
     }
 
     const sectionChanged = this.renderedSectionId !== section.id;
+    const previousScrollState = !sectionChanged ? captureSettingsScrollState(contentSlot) : null;
     this.renderedSectionId = section.id;
     if (contentSlot) {
       contentSlot.innerHTML = this.renderSection(section, this.model);
+      if (previousScrollState) {
+        restoreSettingsScrollState(contentSlot, previousScrollState);
+      }
       if (sectionChanged) {
         contentSlot.classList.remove("is-section-transitioning");
         void contentSlot.offsetWidth;
@@ -2092,8 +2178,10 @@ export const SettingsScreen = {
     }
     this.setActiveSection(section.id);
     this.integrationView = "hub";
-    this.contentFocusKey = null;
-    await this.render();
+    this.contentFocusKey = section.id === "appearance"
+      ? this.getAppearanceThemeFocusKey()
+      : null;
+    await this.render({ refreshModel: false });
   },
 
   syncNavFocusToActive() {
@@ -2107,17 +2195,118 @@ export const SettingsScreen = {
     const focused = this.container.querySelector(".settings-content-focusable.focused");
     if (focused) {
       this.contentFocusKey = String(focused.dataset.focusKey || "");
+      this.rememberAppearanceThemeFocusKey(this.contentFocusKey);
     }
   },
 
   moveContent(direction) {
     const before = this.container.querySelector(".settings-content-focusable.focused");
+    const beforeFocusKey = String(before?.dataset?.focusKey || "");
+
+    if (
+      this.activeSection === "appearance"
+      && direction === "up"
+      && beforeFocusKey === "appearance:font"
+    ) {
+      const rememberedTheme = this.container.querySelector(
+        focusKeySelector(".settings-content-focusable", this.getAppearanceThemeFocusKey())
+      ) || this.container.querySelector(".settings-theme-card.settings-content-focusable");
+      if (rememberedTheme) {
+        before?.classList?.remove("focused");
+        rememberedTheme.classList.add("focused");
+        rememberedTheme.focus();
+        this.contentFocusKey = String(rememberedTheme.dataset.focusKey || "");
+        this.rememberAppearanceThemeFocusKey(this.contentFocusKey);
+        scrollIntoNearestView(rememberedTheme);
+        return before !== rememberedTheme;
+      }
+    }
+
+    if (
+      this.activeSection === "appearance"
+      && direction === "down"
+      && isAppearanceThemeFocusKey(beforeFocusKey)
+    ) {
+      const themeCards = Array.from(this.container.querySelectorAll(".settings-theme-card.settings-content-focusable"));
+      const beforeRect = before?.getBoundingClientRect?.();
+      const beforeCenterY = beforeRect ? beforeRect.top + (beforeRect.height / 2) : 0;
+      const beforeCenterX = beforeRect ? beforeRect.left + (beforeRect.width / 2) : 0;
+      const themeBelow = themeCards
+        .filter((card) => card !== before)
+        .map((card) => {
+          const rect = card.getBoundingClientRect();
+          const centerY = rect.top + (rect.height / 2);
+          const centerX = rect.left + (rect.width / 2);
+          return {
+            card,
+            verticalDistance: centerY - beforeCenterY,
+            horizontalDistance: Math.abs(centerX - beforeCenterX)
+          };
+        })
+        .filter((entry) => entry.verticalDistance > 2)
+        .sort((left, right) => {
+          if (left.verticalDistance !== right.verticalDistance) {
+            return left.verticalDistance - right.verticalDistance;
+          }
+          return left.horizontalDistance - right.horizontalDistance;
+        });
+
+      const nextTheme = themeBelow[0]?.card || null;
+      if (nextTheme) {
+        before?.classList?.remove("focused");
+        nextTheme.classList.add("focused");
+        nextTheme.focus();
+        this.contentFocusKey = String(nextTheme.dataset.focusKey || "");
+        this.rememberAppearanceThemeFocusKey(this.contentFocusKey);
+        scrollIntoNearestView(nextTheme);
+        return before !== nextTheme;
+      }
+    }
+
     ScreenUtils.moveFocusDirectional(this.container, direction, ".settings-content-focusable");
     const after = this.container.querySelector(".settings-content-focusable.focused");
     if (after) {
       this.contentFocusKey = String(after.dataset.focusKey || "");
+      if (isAppearanceThemeFocusKey(beforeFocusKey)) {
+        this.rememberAppearanceThemeFocusKey(beforeFocusKey);
+      }
+      this.rememberAppearanceThemeFocusKey(this.contentFocusKey);
+      scrollIntoNearestView(after);
     }
     return before !== after;
+  },
+
+  handleWheelEvent(event) {
+    const themeGrid = event?.target?.closest?.(".settings-theme-grid");
+    if (!themeGrid) {
+      return;
+    }
+
+    const deltaY = Number(event.deltaY || 0);
+    if (!deltaY) {
+      return;
+    }
+
+    const direction = deltaY < 0 ? "up" : "down";
+    if (!isScrollContainerAtBoundary(themeGrid, direction)) {
+      return;
+    }
+
+    const content = themeGrid.closest(".settings-content");
+    if (!content) {
+      return;
+    }
+
+    event.preventDefault();
+    if (typeof content.scrollBy === "function") {
+      content.scrollBy({
+        top: deltaY,
+        behavior: "auto"
+      });
+      return;
+    }
+
+    content.scrollTop += deltaY;
   },
 
   async activateFocused() {
@@ -2154,7 +2343,10 @@ export const SettingsScreen = {
       const firstContent = this.container.querySelector(".settings-content-focusable");
       if (firstContent) {
         this.focusZone = "content";
-        this.contentFocusKey = String(firstContent.dataset.focusKey || "");
+        this.contentFocusKey = this.activeSection === "appearance"
+          ? this.getAppearanceThemeFocusKey()
+          : String(firstContent.dataset.focusKey || "");
+        this.rememberAppearanceThemeFocusKey(this.contentFocusKey);
         this.applyFocus();
       }
       return;
@@ -2167,6 +2359,7 @@ export const SettingsScreen = {
     }
 
     this.contentFocusKey = focusKey;
+    this.rememberAppearanceThemeFocusKey(this.contentFocusKey);
     await action();
 
     if (Router.getCurrent() === "settings") {
@@ -2181,7 +2374,7 @@ export const SettingsScreen = {
       event?.preventDefault?.();
       if (this.optionDialog) {
         this.closeOptionDialog();
-        await this.render();
+        await this.render({ refreshModel: false });
         return;
       }
       if (this.focusZone === "sidebar") {
@@ -2297,17 +2490,22 @@ export const SettingsScreen = {
       return false;
     }
     this.closeOptionDialog();
-    this.render();
+    void this.render({ refreshModel: false });
     return true;
   },
 
   cleanup() {
     LocalStore.remove(SETTINGS_UI_STATE_KEY);
+    if (this.container && this.handleWheelBound) {
+      this.container.removeEventListener("wheel", this.handleWheelBound);
+    }
+    this.handleWheelBound = null;
     this.activeSection = null;
     this.focusZone = "nav";
     this.sidebarFocusIndex = 0;
     this.navIndex = -1;
     this.contentFocusKey = null;
+    this.appearanceThemeFocusKey = null;
     this.integrationView = "hub";
     this.expandedSections = {};
     this.optionDialog = null;

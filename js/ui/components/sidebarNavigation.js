@@ -40,6 +40,8 @@ const ROOT_SIDEBAR_ITEMS = [
   }
 ];
 
+let sidebarAvatarCatalogPromise = null;
+
 function profileInitial(name) {
   const raw = String(name || "").trim();
   return raw ? raw.charAt(0).toUpperCase() : "P";
@@ -64,6 +66,13 @@ function t(key, params = {}, fallback = key) {
   return I18n.t(key, params, { fallback });
 }
 
+function getThemeAccentFallback() {
+  const value = globalThis?.document
+    ? getComputedStyle(document.documentElement).getPropertyValue("--secondary-color").trim()
+    : "";
+  return value || "#f5f5f5";
+}
+
 function itemLabel(item) {
   return t(item?.labelKey, {}, String(item?.label || item?.route || ""));
 }
@@ -76,10 +85,29 @@ function getItemForAction(action = "") {
   return ROOT_SIDEBAR_ITEMS.find((item) => item.action === String(action || "")) || null;
 }
 
+function getModernSidebarPresentation() {
+  return {
+    showPill: true,
+    keepPillExpanded: true
+  };
+}
+
+function getSidebarAvatarCatalog() {
+  if (!sidebarAvatarCatalogPromise) {
+    sidebarAvatarCatalogPromise = AvatarRepository.getAvatarCatalog().catch(() => {
+      sidebarAvatarCatalogPromise = null;
+      return [];
+    });
+  }
+  return sidebarAvatarCatalogPromise;
+}
+
 export async function getSidebarProfileState() {
   const activeProfileId = String(ProfileManager.getActiveProfileId() || "");
-  const profiles = await ProfileManager.getProfiles();
-  const avatarCatalog = await AvatarRepository.getAvatarCatalog().catch(() => []);
+  const [profiles, avatarCatalog] = await Promise.all([
+    ProfileManager.getProfiles(),
+    getSidebarAvatarCatalog()
+  ]);
   const activeProfile = profiles.find((profile) => String(profile.id || profile.profileIndex || "1") === activeProfileId)
     || profiles[0]
     || null;
@@ -88,9 +116,9 @@ export async function getSidebarProfileState() {
   return {
     activeProfileName: String(activeProfile?.name || t("sidebar.profileFallback")).trim() || t("sidebar.profileFallback"),
     activeProfileInitial: profileInitial(activeProfile?.name || t("sidebar.profileFallback")),
-    activeProfileColorHex: String(activeProfile?.avatarColorHex || "#1E88E5"),
+    activeProfileColorHex: String(activeProfile?.avatarColorHex || getThemeAccentFallback()),
     activeProfileAvatarUrl: String(activeProfileAvatarUrl || ""),
-    showProfileSelector: profiles.length > 1
+    showProfileSelector: Boolean(activeProfile)
   };
 }
 
@@ -134,7 +162,7 @@ export function renderLegacySidebar({
         <button class="home-profile-pill focusable"
                 data-action="gotoAccount"
                 aria-label="${t("sidebar.switchProfile")}">
-          <span class="home-profile-avatar" style="background:${profileState.activeProfileColorHex || "#1E88E5"}">
+          <span class="home-profile-avatar" style="background:${profileState.activeProfileColorHex || getThemeAccentFallback()}">
             ${profileState.activeProfileAvatarUrl
               ? `<img class="sidebar-profile-avatar-image" src="${profileState.activeProfileAvatarUrl}" alt="${profileState.activeProfileName || t("sidebar.profileFallback")}" />`
               : (profileState.activeProfileInitial || "P")}
@@ -166,8 +194,7 @@ export function renderModernSidebar({
   const selectedItem = getSelectedItem(selectedRoute);
   const profileState = profile || {};
   const showProfileSelector = Boolean(profileState.showProfileSelector && profileState.activeProfileName);
-  const showPill = selectedRoute !== "search";
-  const keepPillExpanded = selectedRoute === "settings";
+  const { showPill, keepPillExpanded } = getModernSidebarPresentation();
   const selectedLabel = itemLabel(selectedItem);
   const performanceConstrained = Platform.isWebOS() || Platform.isTizen();
 
@@ -185,7 +212,7 @@ export function renderModernSidebar({
       <aside class="modern-sidebar-panel" aria-hidden="${expanded ? "false" : "true"}"${expanded ? "" : " hidden"}>
         ${showProfileSelector ? `
           <button class="modern-sidebar-profile focusable" data-action="gotoAccount" aria-label="${t("sidebar.switchProfile")}">
-            <span class="modern-sidebar-profile-avatar" style="background:${profileState.activeProfileColorHex || "#1E88E5"}">
+            <span class="modern-sidebar-profile-avatar" style="background:${profileState.activeProfileColorHex || getThemeAccentFallback()}">
               ${profileState.activeProfileAvatarUrl
                 ? `<img class="sidebar-profile-avatar-image" src="${profileState.activeProfileAvatarUrl}" alt="${profileState.activeProfileName || t("sidebar.profileFallback")}" />`
                 : (profileState.activeProfileInitial || "P")}
@@ -339,8 +366,11 @@ export function isRootSidebarNode(node) {
 }
 
 export function setModernSidebarPillIconOnly(container, iconOnly, keepExpanded = false) {
+  const shell = container?.querySelector(".modern-sidebar-shell");
   const pill = container?.querySelector(".modern-sidebar-pill");
-  if (!pill || keepExpanded) {
+  const shouldKeepExpanded = Boolean(keepExpanded || shell?.classList?.contains("keep-pill-expanded"));
+  if (!pill || shouldKeepExpanded) {
+    pill?.classList.remove("icon-only");
     return;
   }
   pill.classList.toggle("icon-only", Boolean(iconOnly));

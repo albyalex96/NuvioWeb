@@ -4,7 +4,7 @@ import { Environment } from "../../../platform/environment.js";
 import { Platform } from "../../../platform/index.js";
 import { LayoutPreferences } from "../../../data/local/layoutPreferences.js";
 import { LibraryController, LIBRARY_PRIVACY_OPTIONS } from "./libraryController.js";
-import { renderFilterPicker } from "../../components/filterPicker.js";
+import { renderContentFilterPicker } from "../../components/filterPicker.js";
 import {
   activateLegacySidebarAction,
   bindRootSidebarEvents,
@@ -108,12 +108,57 @@ function findNearestNodeByCenterX(referenceNode, nodes = []) {
   return bestNode;
 }
 
+function groupNodesByRow(nodes = [], tolerance = 28) {
+  const rows = [];
+  nodes.forEach((node) => {
+    const rect = node.getBoundingClientRect();
+    const top = rect.top;
+    const existingRow = rows.find((row) => Math.abs(row.top - top) <= tolerance);
+    if (existingRow) {
+      existingRow.nodes.push(node);
+      return;
+    }
+    rows.push({
+      top,
+      nodes: [node]
+    });
+  });
+  rows.sort((left, right) => left.top - right.top);
+  rows.forEach((row) => {
+    row.nodes.sort((left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left);
+  });
+  return rows;
+}
+
 export const LibraryScreen = {
+
+  cancelScheduledRender() {
+    if (this.renderFrame) {
+      cancelAnimationFrame(this.renderFrame);
+      this.renderFrame = null;
+    }
+  },
+
+  requestRender() {
+    if (!this.container || Router.getCurrent() !== "library") {
+      return;
+    }
+    if (this.renderFrame) {
+      return;
+    }
+    this.renderFrame = requestAnimationFrame(() => {
+      this.renderFrame = null;
+      if (!this.container || Router.getCurrent() !== "library") {
+        return;
+      }
+      this.render();
+    });
+  },
 
   async mount() {
     this.container = document.getElementById("library");
     ScreenUtils.show(this.container);
-    this.controller = new LibraryController(() => this.render());
+    this.controller = new LibraryController(() => this.requestRender());
     this.libraryRouteEnterPending = true;
     this.sidebarProfile = await getSidebarProfileState();
     this.layoutPrefs = LayoutPreferences.get();
@@ -217,17 +262,20 @@ export const LibraryScreen = {
 
   renderPicker(picker, title, value, options, widthClass = "") {
     const state = this.controller.getState();
-    return renderFilterPicker({
+    const currentValue = picker === "list"
+      ? state.selectedListKey
+      : (picker === "type" ? state.selectedTypeKey : state.selectedSortKey);
+    const selectedIndex = Math.max(0, options.findIndex((option) => option.value === currentValue));
+    return renderContentFilterPicker({
+      variant: "library",
       picker,
       title,
       value,
       options,
       open: state.expandedPicker === picker,
       focusIndex: Number(state.pickerFocusIndex || 0),
+      selectedIndex,
       widthClass,
-      classPrefix: "library-picker",
-      anchorExtraClass: "library-primary",
-      optionFocusable: true,
       targetOptionClass: "library-picker-option-target"
     });
   },
@@ -404,6 +452,7 @@ export const LibraryScreen = {
   },
 
   render() {
+    this.cancelScheduledRender();
     this.layoutPrefs = LayoutPreferences.get();
     this.sidebarExpanded = Boolean(this.layoutPrefs?.modernSidebar && this.sidebarExpanded);
     const state = this.controller.getState();
@@ -599,6 +648,58 @@ export const LibraryScreen = {
       || null;
   },
 
+  resolveRelativeGridNode(current, direction) {
+    if (!current || !current.matches?.(".library-grid-card.focusable")) {
+      return null;
+    }
+    const cards = Array.from(this.container?.querySelectorAll(".library-grid-card.focusable") || []);
+    if (!cards.length) {
+      return null;
+    }
+    const rows = groupNodesByRow(cards);
+    if (!rows.length) {
+      return null;
+    }
+    const currentRect = current.getBoundingClientRect();
+    const currentCenterX = currentRect.left + (currentRect.width / 2);
+    const rowIndex = rows.findIndex((row) => row.nodes.includes(current));
+    if (rowIndex < 0) {
+      return null;
+    }
+    const currentRow = rows[rowIndex];
+    const columnIndex = Math.max(0, currentRow.nodes.indexOf(current));
+
+    if (direction === "left") {
+      return currentRow.nodes[columnIndex - 1] || current;
+    }
+    if (direction === "right") {
+      return currentRow.nodes[columnIndex + 1] || current;
+    }
+    if (direction === "up") {
+      const previousRow = rows[rowIndex - 1];
+      return previousRow ? findNearestNodeByCenterX(current, previousRow.nodes) : null;
+    }
+    if (direction === "down") {
+      const nextRow = rows[rowIndex + 1];
+      if (!nextRow) {
+        return current;
+      }
+      let bestNode = nextRow.nodes[0] || null;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      nextRow.nodes.forEach((node) => {
+        const rect = node.getBoundingClientRect();
+        const centerX = rect.left + (rect.width / 2);
+        const distance = Math.abs(centerX - currentCenterX);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestNode = node;
+        }
+      });
+      return bestNode;
+    }
+    return null;
+  },
+
   handleActionsRowNavigation(event, current) {
     if (!current || !current.closest?.(".library-actions-row")) {
       return false;
@@ -685,6 +786,43 @@ export const LibraryScreen = {
       return true;
     }
     const target = anchors[nextIndex] || null;
+    if (!target) {
+      return false;
+    }
+    event?.preventDefault?.();
+    this.setFocusedNode(target);
+    return true;
+  },
+
+  handleGridNavigation(event, current) {
+    if (!current || !current.matches?.(".library-grid-card.focusable") || !current.closest?.(".library-grid")) {
+      return false;
+    }
+    const code = Number(event?.keyCode || 0);
+    const direction = code === 37
+      ? "left"
+      : code === 39
+        ? "right"
+        : code === 38
+          ? "up"
+          : code === 40
+            ? "down"
+            : "";
+    if (!direction) {
+      return false;
+    }
+    if (direction === "up") {
+      const target = this.controller.getState().sourceMode === "trakt"
+        ? this.resolvePreferredActionsRowNode() || this.resolvePreferredPickerRowNode(current)
+        : this.resolvePreferredPickerRowNode(current);
+      if (!target) {
+        return false;
+      }
+      event?.preventDefault?.();
+      this.setFocusedNode(target);
+      return true;
+    }
+    const target = this.resolveRelativeGridNode(current, direction);
     if (!target) {
       return false;
     }
@@ -997,6 +1135,10 @@ export const LibraryScreen = {
       return;
     }
 
+    if (!sidebarLocked && this.handleGridNavigation(event, current)) {
+      return;
+    }
+
     if (state.expandedPicker && (code === 38 || code === 40)) {
       event?.preventDefault?.();
       this.controller.movePickerFocus(code === 38 ? "up" : "down");
@@ -1027,6 +1169,7 @@ export const LibraryScreen = {
   },
 
   cleanup() {
+    this.cancelScheduledRender();
     this.controller?.dispose?.();
     this.controller = null;
     ScreenUtils.hide(this.container);

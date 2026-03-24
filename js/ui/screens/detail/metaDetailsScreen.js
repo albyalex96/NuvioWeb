@@ -10,6 +10,7 @@ import { watchedItemsRepository } from "../../../data/repository/watchedItemsRep
 import { TmdbService } from "../../../core/tmdb/tmdbService.js";
 import { TmdbMetadataService } from "../../../core/tmdb/tmdbMetadataService.js";
 import { LayoutPreferences } from "../../../data/local/layoutPreferences.js";
+import { imdbEpisodeRatingsRepository } from "../../../data/repository/imdbEpisodeRatingsRepository.js";
 import { TmdbSettingsStore } from "../../../data/local/tmdbSettingsStore.js";
 import { PlayerSettingsStore } from "../../../data/local/playerSettingsStore.js";
 import { Environment } from "../../../platform/environment.js";
@@ -18,6 +19,7 @@ import { I18n } from "../../../i18n/index.js";
 import { renderHoldMenuMarkup } from "../../components/holdMenu.js";
 
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
+const EPISODE_HOLD_DELAY_MS = 650;
 
 function t(key, params = {}, fallback = key) {
   return I18n.t(key, params, { fallback });
@@ -469,6 +471,7 @@ function buildYoutubeEmbedUrl(ytId = "") {
       proxyUrl.searchParams.set("playlist", cleanId);
       proxyUrl.searchParams.set("playsinline", "1");
       proxyUrl.searchParams.set("rel", "0");
+      proxyUrl.searchParams.set("_cb", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
       return proxyUrl.toString();
     } catch (_) {
       return "";
@@ -495,30 +498,6 @@ function buildYoutubeEmbedUrl(ytId = "") {
   return `https://www.youtube-nocookie.com/embed/${cleanId}?${params.toString()}`;
 }
 
-function buildYoutubeStreamUrl(ytId = "") {
-  const cleanId = String(ytId || "").trim();
-  if (!cleanId) {
-    return "";
-  }
-  const proxyBase = String(YOUTUBE_PROXY_URL || "").trim();
-  if (!proxyBase) {
-    return "";
-  }
-  const templated = proxyBase.replace(/\{(ytId|id)\}/gi, cleanId);
-  if (templated !== proxyBase) {
-    return templated;
-  }
-  try {
-    const proxyUrl = new URL(proxyBase, globalThis?.location?.href || "https://example.com/");
-    proxyUrl.searchParams.set("v", cleanId);
-    proxyUrl.searchParams.set("stream", "1");
-    proxyUrl.searchParams.set("format", "mp4");
-    return proxyUrl.toString();
-  } catch (_) {
-    return "";
-  }
-}
-
 function buildInlineYoutubePlayerUrl(ytId = "", { muted = true } = {}) {
   const cleanId = String(ytId || "").trim();
   if (!cleanId) {
@@ -536,6 +515,7 @@ function buildInlineYoutubePlayerUrl(ytId = "", { muted = true } = {}) {
       proxyUrl.searchParams.set("playlist", cleanId);
       proxyUrl.searchParams.set("playsinline", "1");
       proxyUrl.searchParams.set("rel", "0");
+      proxyUrl.searchParams.set("_cb", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
       return proxyUrl.toString();
     } catch (_) {
       return "";
@@ -559,82 +539,32 @@ function buildInlineYoutubePlayerUrl(ytId = "", { muted = true } = {}) {
   return `https://www.youtube-nocookie.com/embed/${cleanId}?${params.toString()}`;
 }
 
-function scoreTrailerStream(entry = {}) {
-  const text = [
-    entry?.quality,
-    entry?.label,
-    entry?.name,
-    entry?.title,
-    entry?.description,
-    entry?.resolution
-  ].map((value) => String(value || "")).join(" ").toLowerCase();
-  const width = Number(entry?.width || 0);
-  const height = Number(entry?.height || entry?.resolutionHeight || 0);
-  const bitrate = Number(entry?.bitrate || 0);
-  let score = 0;
-
-  if (width >= 3840 || height >= 2160 || /2160|4k|uhd/.test(text)) score += 120;
-  else if (width >= 2560 || height >= 1440 || /1440|2k|qhd/.test(text)) score += 90;
-  else if (width >= 1920 || height >= 1080 || /1080|full\s*hd|fhd/.test(text)) score += 70;
-  else if (width >= 1280 || height >= 720 || /720|hd\b/.test(text)) score += 45;
-  else if (width > 0 || height > 0) score += 20;
-
-  score += Math.max(0, Math.min(20, Math.round(bitrate / 500000)));
-
-  if (/hdr|dolby/.test(text)) score += 8;
-  if (/hevc|h265|av1/.test(text)) score += 6;
-
-  return score;
-}
-
 function resolveTrailerSource(meta = {}) {
-  const allowYoutubeTrailer = !Environment.isWebOS() && !Environment.isTizen();
-  const trailerStreams = Array.isArray(meta?.trailerStreams) ? meta.trailerStreams : [];
-  const directVideo = trailerStreams
-    .filter((entry) => {
-      const url = String(entry?.url || entry?.videoUrl || entry?.stream || "").trim();
-      return /^https?:\/\//i.test(url);
-    })
-    .sort((left, right) => scoreTrailerStream(right) - scoreTrailerStream(left))[0];
-  if (directVideo) {
-    return {
-      kind: "video",
-      url: String(directVideo.url || directVideo.videoUrl || directVideo.stream || "").trim()
-    };
-  }
-
   const trailerCandidates = [
     ...(Array.isArray(meta?.trailers) ? meta.trailers : []),
     ...(Array.isArray(meta?.videos) ? meta.videos : [])
   ];
-  if (allowYoutubeTrailer) {
-    for (const entry of trailerCandidates) {
-      const ytId = resolveYoutubeId(
-        entry?.ytId
-        || entry?.youtubeId
-        || entry?.source
-        || entry?.url
-        || entry?.link
-        || ""
-      );
-      if (ytId) {
-        const embedUrl = buildYoutubeEmbedUrl(ytId);
-        if (!embedUrl) {
-          continue;
-        }
-        return {
-          kind: "youtube",
-          ytId,
-          embedUrl
-        };
+  for (const entry of trailerCandidates) {
+    const ytId = resolveYoutubeId(
+      entry?.ytId
+      || entry?.youtubeId
+      || entry?.source
+      || entry?.url
+      || entry?.link
+      || ""
+    );
+    if (ytId) {
+      const embedUrl = buildYoutubeEmbedUrl(ytId);
+      if (!embedUrl) {
+        continue;
       }
+      return {
+        kind: "youtube",
+        ytId,
+        embedUrl
+      };
     }
   }
-
-  if (!allowYoutubeTrailer) {
-    return null;
-  }
-
   const ytId = resolveYoutubeId(Array.isArray(meta?.trailerYtIds) ? meta.trailerYtIds[0] : "");
   if (!ytId) {
     return null;
@@ -675,6 +605,20 @@ function formatPlaybackTime(value = 0) {
     return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function normalizeTrailerProxyStatePayload(payload, fallbackMuted = false) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const nestedState = source.state && typeof source.state === "object" ? source.state : null;
+  const candidate = nestedState || source;
+  return {
+    currentTime: Number(candidate.currentTime || 0),
+    duration: Number(candidate.duration || 0),
+    paused: Boolean(candidate.paused),
+    muted: candidate.muted == null ? Boolean(fallbackMuted) : Boolean(candidate.muted),
+    loading: Boolean(candidate.loading),
+    controllable: candidate.controllable !== false
+  };
 }
 
 function captureHorizontalScrollMap(container) {
@@ -829,18 +773,11 @@ export const MetaDetailsScreen = {
         return;
       }
       if (data.type === "state") {
-        const nextState = data.state && typeof data.state === "object" ? data.state : {};
+        const nextState = normalizeTrailerProxyStatePayload(data, this.trailerMuted);
         if (nextState.loading === false || Number(nextState.duration || 0) > 0 || Number(nextState.currentTime || 0) > 0) {
           this.stopTrailerProxyLoadingTimer();
         }
-        this.trailerProxyState = {
-          currentTime: Number(nextState.currentTime || 0),
-          duration: Number(nextState.duration || 0),
-          paused: Boolean(nextState.paused),
-          muted: Boolean(nextState.muted),
-          loading: Boolean(nextState.loading),
-          controllable: nextState.controllable !== false
-        };
+        this.trailerProxyState = nextState;
         this.trailerYoutubeFallbackActive = nextState.controllable === false;
         this.updateTrailerOverlay();
       }
@@ -955,22 +892,35 @@ export const MetaDetailsScreen = {
       return;
     }
 
-    const metaResult = await withTimeout(
+    const metaPromise = withTimeout(
       metaRepository.getMetaFromAllAddons(itemType, itemId),
       4500,
       { status: "error", message: "timeout" }
     );
+    const isSavedPromise = savedLibraryRepository.isSaved(itemId);
+    const progressPromise = watchProgressRepository.getProgressByContentId(itemId);
+    const watchedItemPromise = watchedItemsRepository.isWatched(itemId);
+    const allProgressPromise = watchProgressRepository.getAll();
+    const allWatchedPromise = watchedItemsRepository.getAll();
+
+    const [
+      metaResult,
+      isSaved,
+      progress,
+      watchedItem,
+      allProgressItems,
+      allWatchedItems
+    ] = await Promise.all([
+      metaPromise,
+      isSavedPromise,
+      progressPromise,
+      watchedItemPromise,
+      allProgressPromise,
+      allWatchedPromise
+    ]);
     const meta = metaResult.status === "success"
       ? metaResult.data
       : { id: itemId, type: itemType, name: fallbackTitle, description: "" };
-
-    const [isSaved, progress, watchedItem, allProgressItems, allWatchedItems] = await Promise.all([
-      savedLibraryRepository.isSaved(itemId),
-      watchProgressRepository.getProgressByContentId(itemId),
-      watchedItemsRepository.isWatched(itemId),
-      watchProgressRepository.getAll(),
-      watchedItemsRepository.getAll()
-    ]);
     if (token !== this.detailLoadToken) {
       return;
     }
@@ -1001,6 +951,7 @@ export const MetaDetailsScreen = {
     this.render(meta);
     this.isLoadingDetail = false;
     this.maybeAutoOpenContinueWatchingStream();
+    void this.refreshTrailerSource(meta, token);
 
     // Background enrichments: do not block initial screen rendering.
     (async () => {
@@ -1024,6 +975,7 @@ export const MetaDetailsScreen = {
       this.selectedRatingSeason = this.selectedRatingSeason || this.selectedSeason || 1;
       this.nextEpisodeToWatch = this.computeNextEpisodeToWatch(progress);
       this.updateRenderedDetailSections(this.meta);
+      void this.refreshTrailerSource(this.meta, token);
 
       const tasks = [
         withTimeout(this.fetchMoreLikeThis(this.meta), 5000, [])
@@ -1228,6 +1180,17 @@ export const MetaDetailsScreen = {
     this.navigateToStreamScreenForMovie(extraParams);
   },
 
+  navigateBackFromDetail() {
+    if (this.params?.returnHomeOnBack) {
+      Router.navigate("home", {}, {
+        skipStackPush: true,
+        replaceHistory: true
+      });
+      return true;
+    }
+    return false;
+  },
+
   async enrichMeta(meta) {
     const settings = TmdbSettingsStore.get();
     if (!settings.enabled || !settings.apiKey || !meta?.id) {
@@ -1340,6 +1303,10 @@ export const MetaDetailsScreen = {
       if (!tmdbId) {
         return {};
       }
+      const directRatings = await imdbEpisodeRatingsRepository.getSeasonRatingsByTmdbId(tmdbId);
+      if (Object.keys(directRatings || {}).length) {
+        return directRatings;
+      }
       const seasons = Array.from(new Set(this.episodes.map((episode) => Number(episode.season || 0)).filter((value) => value > 0)));
       const entries = await Promise.all(seasons.map(async (season) => {
         const ratings = await TmdbMetadataService.fetchSeasonRatings({
@@ -1353,6 +1320,29 @@ export const MetaDetailsScreen = {
     } catch (error) {
       console.warn("Series ratings enrichment failed", error);
       return {};
+    }
+  },
+
+  async resolvePreferredTrailerSource(meta = this.meta) {
+    if (!meta) {
+      return null;
+    }
+    return resolveTrailerSource(meta);
+  },
+
+  async refreshTrailerSource(meta = this.meta, token = this.detailLoadToken) {
+    const nextSource = await this.resolvePreferredTrailerSource(meta);
+    if (token !== this.detailLoadToken) {
+      return;
+    }
+    const currentKey = JSON.stringify(this.trailerSource || null);
+    const nextKey = JSON.stringify(nextSource || null);
+    if (currentKey === nextKey) {
+      return;
+    }
+    this.trailerSource = nextSource;
+    if (!this.isTrailerPlaying) {
+      this.updateRenderedDetailSections(this.meta || meta);
     }
   },
 
@@ -1504,11 +1494,12 @@ export const MetaDetailsScreen = {
       : `<h1 class="series-detail-title">${escapeHtml(meta.name || "Untitled")}</h1>`;
     const externalRatings = this.renderExternalRatingsRow(meta);
     const trailerSource = this.trailerSource || resolveTrailerSource(meta);
+    const hasTrailerCandidate = Boolean(trailerSource);
     if (!this.trailerSource && trailerSource) {
       this.trailerSource = trailerSource;
     }
     const trailerButtonEnabled = Boolean(LayoutPreferences.get().detailPageTrailerButtonEnabled);
-    const trailerButton = trailerButtonEnabled && trailerSource
+    const trailerButton = trailerButtonEnabled && hasTrailerCandidate
       ? `
           <button class="series-circle-btn focusable" data-action="toggleTrailer" aria-label="${escapeAttribute(t("detail.playTrailer", {}, "Play trailer"))}">
             ${renderTrailerGlyph()}
@@ -2048,6 +2039,73 @@ export const MetaDetailsScreen = {
     return this.applyEpisodeHoldMenuFocus();
   },
 
+  isEpisodeHoldTarget(node) {
+    return Boolean(node?.matches?.(".series-episode-card.focusable"));
+  },
+
+  cancelPendingEpisodeHold() {
+    if (this.pendingEpisodeHoldTimer) {
+      clearTimeout(this.pendingEpisodeHoldTimer);
+      this.pendingEpisodeHoldTimer = null;
+    }
+    this.pendingEpisodeHoldTarget = null;
+  },
+
+  hasPendingEpisodeHold(node) {
+    const pending = this.pendingEpisodeHoldTarget;
+    if (!pending || !node) {
+      return false;
+    }
+    return String(node.dataset.videoId || "") === String(pending.videoId || "");
+  },
+
+  startPendingEpisodeHold(node) {
+    const videoId = String(node?.dataset?.videoId || "");
+    if (!videoId) {
+      return false;
+    }
+    this.cancelPendingEpisodeHold();
+    this.pendingEpisodeHoldTarget = {
+      videoId,
+      holdTriggered: false
+    };
+    this.pendingEpisodeHoldTimer = setTimeout(() => {
+      this.pendingEpisodeHoldTimer = null;
+      const pending = this.pendingEpisodeHoldTarget;
+      if (!pending || Router.getCurrent() !== "detail") {
+        return;
+      }
+      const current = this.container?.querySelector(".series-episode-card.focusable.focused") || null;
+      if (!this.hasPendingEpisodeHold(current)) {
+        return;
+      }
+      pending.holdTriggered = true;
+      this.openEpisodeHoldMenu(current);
+    }, EPISODE_HOLD_DELAY_MS);
+    return true;
+  },
+
+  async completePendingEpisodeHold(node) {
+    const pending = this.pendingEpisodeHoldTarget;
+    if (!pending) {
+      return false;
+    }
+    const holdTriggered = Boolean(pending.holdTriggered);
+    this.cancelPendingEpisodeHold();
+    if (holdTriggered) {
+      return true;
+    }
+    if (!this.isEpisodeHoldTarget(node)) {
+      return false;
+    }
+    const selectedEpisode = this.episodes.find((entry) => entry.id === node.dataset.videoId);
+    if (!selectedEpisode) {
+      return false;
+    }
+    await this.openEpisodeStreamChooser(selectedEpisode.id);
+    return true;
+  },
+
   openEpisodeHoldMenu(node) {
     const episode = this.getEpisodeByVideoId(node?.dataset?.videoId || "");
     if (!episode) {
@@ -2086,11 +2144,16 @@ export const MetaDetailsScreen = {
   },
 
   async refreshEpisodePlaybackState() {
-    const [progress, allProgressItems, allWatchedItems] = await Promise.all([
+    const [progress, allProgressItems, allWatchedItems, watchedItem] = await Promise.all([
       watchProgressRepository.getProgressByContentId(this.params?.itemId),
       watchProgressRepository.getAll(),
-      watchedItemsRepository.getAll()
+      watchedItemsRepository.getAll(),
+      watchedItemsRepository.isWatched(this.params?.itemId)
     ]);
+    this.isMarkedWatched = Boolean(
+      watchedItem
+      || (progress && Number(progress.durationMs || 0) > 0 && Number(progress.positionMs || 0) >= Number(progress.durationMs || 0))
+    );
     this.buildEpisodeState(allProgressItems, allWatchedItems);
     this.nextEpisodeToWatch = this.computeNextEpisodeToWatch(progress);
   },
@@ -2588,6 +2651,9 @@ export const MetaDetailsScreen = {
     this.stopTrailerProgressTimer();
     this.updateTrailerOverlay();
     this.trailerProgressTimer = setInterval(() => {
+      if (this.isTrailerPlaying && this.trailerSource?.kind === "youtube" && !this.trailerYoutubeFallbackActive) {
+        this.postTrailerProxyCommand("getState");
+      }
       this.updateTrailerOverlay();
     }, 250);
   },
@@ -2948,7 +3014,13 @@ export const MetaDetailsScreen = {
     this.startTrailerProgressTimer();
   },
 
-  playTrailer({ muted = null, restart = false, initiatedByUser = true } = {}) {
+  async playTrailer({ muted = null, restart = false, initiatedByUser = true } = {}) {
+    if (!this.trailerSource || this.trailerSource.kind === "youtube") {
+      const preferredSource = await this.resolvePreferredTrailerSource(this.meta);
+      if (preferredSource) {
+        this.trailerSource = preferredSource;
+      }
+    }
     if (!this.trailerSource) {
       return;
     }
@@ -2968,7 +3040,7 @@ export const MetaDetailsScreen = {
   },
 
   openTrailerInPlayer() {
-    this.playTrailer({ muted: false, restart: true, initiatedByUser: true });
+    this.playTrailer({ restart: true, initiatedByUser: true });
   },
 
   stopTrailerPlayback({ keepDom = false, restartAutoplay = true } = {}) {
@@ -2985,6 +3057,17 @@ export const MetaDetailsScreen = {
     if (!keepDom) {
       const layer = this.container?.querySelector(".detail-trailer-layer");
       if (layer) {
+        const activeFrame = layer.querySelector("iframe");
+        if (activeFrame) {
+          try {
+            activeFrame.src = "about:blank";
+          } catch (_) {
+          }
+          try {
+            activeFrame.removeAttribute("src");
+          } catch (_) {
+          }
+        }
         layer.innerHTML = "";
       }
     }
@@ -3182,6 +3265,9 @@ export const MetaDetailsScreen = {
     }
     if (this.isLoadingDetail) {
       Router.navigate("home");
+      return true;
+    }
+    if (this.navigateBackFromDetail()) {
       return true;
     }
     return false;
@@ -4111,6 +4197,11 @@ export const MetaDetailsScreen = {
     const originalKeyCode = Number(event?.originalKeyCode || code || 0);
     const currentFocusedNode = this.container.querySelector(".focusable.focused") || null;
 
+    const isTizenHoldTarget = Environment.isTizen() && this.isEpisodeHoldTarget(currentFocusedNode);
+    if (!isTizenHoldTarget || code !== 13) {
+      this.cancelPendingEpisodeHold();
+    }
+
     if (this.episodeHoldMenu) {
       if (isBackEvent(event)) {
         event?.preventDefault?.();
@@ -4182,11 +4273,20 @@ export const MetaDetailsScreen = {
       }
     }
 
-    const wantsEpisodeHoldMenu = currentFocusedNode?.matches?.(".series-episode-card.focusable")
+    const isEpisodeHoldTarget = this.isEpisodeHoldTarget(currentFocusedNode);
+    const wantsEpisodeHoldMenu = isEpisodeHoldTarget
       && ((code === 13 && event?.repeat) || originalKeyCode === 82 || code === 93);
     if (wantsEpisodeHoldMenu) {
       event?.preventDefault?.();
+      this.cancelPendingEpisodeHold();
       this.openEpisodeHoldMenu(currentFocusedNode);
+      return;
+    }
+    if (Environment.isTizen() && code === 13 && isEpisodeHoldTarget) {
+      event?.preventDefault?.();
+      if (!event?.repeat && !this.hasPendingEpisodeHold(currentFocusedNode)) {
+        this.startPendingEpisodeHold(currentFocusedNode);
+      }
       return;
     }
 
@@ -4213,6 +4313,9 @@ export const MetaDetailsScreen = {
 
     const action = current.dataset.action;
     if (action === "goBack") {
+      if (this.navigateBackFromDetail()) {
+        return;
+      }
       Router.back();
       return;
     }
@@ -4341,10 +4444,10 @@ export const MetaDetailsScreen = {
     }
 
     if (action === "toggleWatched") {
+      const focusRestore = this.captureDetailFocus();
       if (this.isMarkedWatched) {
         await watchedItemsRepository.unmark(this.params?.itemId);
         await watchProgressRepository.removeProgress(this.params?.itemId);
-        this.isMarkedWatched = false;
       } else {
         await watchedItemsRepository.mark({
           contentId: this.params?.itemId,
@@ -4360,9 +4463,9 @@ export const MetaDetailsScreen = {
           durationMs: 100,
           updatedAt: Date.now()
         });
-        this.isMarkedWatched = true;
       }
-      this.syncDetailActionButtons();
+      await this.refreshEpisodePlaybackState();
+      this.render(this.meta, focusRestore);
       return;
     }
 
@@ -4393,8 +4496,22 @@ export const MetaDetailsScreen = {
     }
   },
 
+  async onKeyUp(event) {
+    if (!Environment.isTizen()) {
+      return;
+    }
+    if (Number(event?.keyCode || 0) !== 13) {
+      return;
+    }
+    const current = this.container?.querySelector(".series-episode-card.focusable.focused") || null;
+    if (await this.completePendingEpisodeHold(current)) {
+      event?.preventDefault?.();
+    }
+  },
+
   cleanup() {
     this.detailLoadToken = (this.detailLoadToken || 0) + 1;
+    this.cancelPendingEpisodeHold();
     this.episodeHoldMenu = null;
     this.stopTrailerPlayback({ keepDom: false, restartAutoplay: false });
     if (this.detailScrollHandler && this.container) {
