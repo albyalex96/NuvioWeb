@@ -618,6 +618,13 @@ export const PlayerController = {
       this.selectedAvPlayAudioTrackIndex = targetIndex;
       this.syncAvPlayTrackInfo();
       this.emitVideoEvent("avplaytrackschanged", { playbackEngine: this.playbackEngine });
+      setTimeout(() => {
+        if (!this.isUsingAvPlay()) {
+          return;
+        }
+        this.syncAvPlayTrackInfo();
+        this.emitVideoEvent("avplaytrackschanged", { playbackEngine: this.playbackEngine });
+      }, 400);
       return true;
     } catch (_) {
       return false;
@@ -858,17 +865,6 @@ export const PlayerController = {
       this.avplayEnded = false;
       this.refreshAvPlayTimeline();
       this.syncAvPlayTrackInfo();
-      if (this.avplayAudioTracks.length && this.selectedAvPlayAudioTrackIndex < 0) {
-        const fallbackAudioIndex = Number(this.avplayAudioTracks[0]?.avplayTrackIndex);
-        if (Number.isFinite(fallbackAudioIndex) && fallbackAudioIndex >= 0) {
-          try {
-            avplay.setSelectTrack?.("AUDIO", fallbackAudioIndex);
-            this.selectedAvPlayAudioTrackIndex = fallbackAudioIndex;
-          } catch (_) {
-            // Ignore initial audio-track selection failures.
-          }
-        }
-      }
       this.emitVideoEvent("loadedmetadata", { playbackEngine: this.playbackEngine });
       this.emitVideoEvent("loadeddata", { playbackEngine: this.playbackEngine });
       this.emitVideoEvent("canplay", { playbackEngine: this.playbackEngine });
@@ -878,6 +874,13 @@ export const PlayerController = {
         this.isPlaying = true;
         this.startAvPlayTickTimer();
         this.emitVideoEvent("playing", { playbackEngine: this.playbackEngine });
+        setTimeout(() => {
+          if (!this.isUsingAvPlay()) {
+            return;
+          }
+          this.syncAvPlayTrackInfo();
+          this.emitVideoEvent("avplaytrackschanged", { playbackEngine: this.playbackEngine });
+        }, 500);
       } catch (error) {
         this.lastPlaybackErrorCode = this.mapAvPlayErrorToMediaCode(error?.name || error?.message || error);
         this.isPlaying = false;
@@ -1055,6 +1058,7 @@ export const PlayerController = {
   getPlaybackEngineCandidates(url, sourceType = null) {
     const normalizedSourceType = String(sourceType || this.guessMediaMimeType(url) || "").trim();
     const avplayEngine = this.getPlatformAvplayEngineName();
+    const isTizenRuntime = Platform.isTizen();
     const pushCandidate = (target, candidate) => {
       const normalized = String(candidate || "").trim();
       if (!normalized || target.includes(normalized)) {
@@ -1065,13 +1069,13 @@ export const PlayerController = {
 
     if (this.isLikelyHlsMimeType(normalizedSourceType)) {
       const candidates = [];
-      if (Platform.isTizen() && this.canUseAvPlay()) {
-        pushCandidate(candidates, avplayEngine);
+      if (isTizenRuntime && this.canUseHlsJs()) {
+        pushCandidate(candidates, "hls.js");
       }
       if (this.canPlayNatively("application/vnd.apple.mpegurl")) {
         pushCandidate(candidates, "native-hls");
       }
-      if (this.canUseHlsJs()) {
+      if (!isTizenRuntime && this.canUseHlsJs()) {
         pushCandidate(candidates, "hls.js");
       }
       if (this.canUseAvPlay()) {
@@ -1082,17 +1086,20 @@ export const PlayerController = {
 
     if (this.isLikelyDashMimeType(normalizedSourceType)) {
       const candidates = [];
-      if (Platform.isTizen() && this.canUseAvPlay()) {
-        pushCandidate(candidates, avplayEngine);
+      if (isTizenRuntime && this.canUseDashJs()) {
+        pushCandidate(candidates, "dash.js");
       }
       if (Platform.isWebOS() && this.canPlayNatively("application/dash+xml")) {
         pushCandidate(candidates, "native-dash");
       }
-      if (this.canUseDashJs()) {
+      if (!isTizenRuntime && this.canUseDashJs()) {
         pushCandidate(candidates, "dash.js");
       }
       if (this.canPlayNatively("application/dash+xml")) {
         pushCandidate(candidates, "native-dash");
+      }
+      if (this.canUseAvPlay()) {
+        pushCandidate(candidates, avplayEngine);
       }
       return candidates;
     }
@@ -1109,10 +1116,16 @@ export const PlayerController = {
     }
 
     const candidates = [];
-    if (this.canUseAvPlay()) {
+    if (isTizenRuntime) {
+      pushCandidate(candidates, "native-file");
+    }
+    if (!isTizenRuntime && this.canUseAvPlay()) {
       pushCandidate(candidates, avplayEngine);
     }
     pushCandidate(candidates, "native-file");
+    if (isTizenRuntime && this.canUseAvPlay()) {
+      pushCandidate(candidates, avplayEngine);
+    }
     return candidates;
   },
 
@@ -1835,6 +1848,7 @@ export const PlayerController = {
         this.isUsingNativePlayback()
         && isDirectFile
         && audioTrackCount <= 0
+        && Platform.isWebOS()
         && this.canUseAvPlay()
       ) {
         this.forceAvPlayFallbackForCurrentSource("native_playing_no_audio_tracks");
@@ -1853,6 +1867,7 @@ export const PlayerController = {
         this.isUsingNativePlayback()
         && isDirectFile
         && audioTrackCount <= 0
+        && Platform.isWebOS()
         && this.canUseAvPlay()
       ) {
         this.forceAvPlayFallbackForCurrentSource("native_no_audio_tracks");
